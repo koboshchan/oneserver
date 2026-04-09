@@ -84,7 +84,9 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "websocket": setting.get("websocket", True),
         "compression": setting.get("compression", True),
         "security_headers": setting.get("security-headers", True),
-        "csp_unsafe_eval": setting.get("csp-unsafe-eval"),
+        "csp_unsafe_eval": setting.get("csp-unsafe-eval")
+        or setting.get("csp_unsafe_eval"),
+        "csp_wildcard": setting.get("csp-wildcard") or setting.get("csp_wildcard"),
         "timeout": setting.get("timeout", "120s"),
         "max_body_size": setting.get("max-body-size", "10m"),
         "allowed_paths": normalized_paths,
@@ -230,6 +232,32 @@ def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
         domain = setting["domain"]
         upstream_name = setting["upstream_name"]
 
+        # Security headers
+        security_headers = ""
+        if setting["security_headers"]:
+            csp_header = ""
+            if setting["csp_wildcard"] is True:
+                csp_header = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;"
+            elif setting["csp_unsafe_eval"] is True:
+                csp_header = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
+            elif setting["csp_unsafe_eval"] is False:
+                csp_header = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
+
+            security_headers = """
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;"""
+            if csp_header:
+                security_headers += (
+                    '''
+        add_header Content-Security-Policy "'''
+                    + csp_header
+                    + """" always;"""
+                )
+
         # WebSocket support
         websocket_headers = ""
         if setting["websocket"]:
@@ -245,7 +273,7 @@ def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
         server_name {domain};
 
         # Maximum request body size
-        client_max_body_size {setting["max_body_size"]};
+        client_max_body_size {setting["max_body_size"]};{security_headers}
 
         # Allow Let's Encrypt ACME challenge
         location /.well-known/acme-challenge/ {{
@@ -277,10 +305,12 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
     security_headers = ""
     if setting["security_headers"]:
         csp_header = ""
-        if setting["csp_unsafe_eval"] is True:
-            csp_header = "script-src 'self' 'unsafe-eval'; default-src 'self' http: https: data: blob: 'unsafe-inline'"
+        if setting["csp_wildcard"] is True:
+            csp_header = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;"
+        elif setting["csp_unsafe_eval"] is True:
+            csp_header = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
         elif setting["csp_unsafe_eval"] is False:
-            csp_header = "default-src 'self' http: https: data: blob: 'unsafe-inline'"
+            csp_header = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
 
         security_headers = """
         # Security headers
