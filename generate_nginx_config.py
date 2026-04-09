@@ -237,7 +237,7 @@ def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
         if setting["security_headers"]:
             csp_header = ""
             if setting["csp_wildcard"] is True:
-                csp_header = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;"
+                csp_header = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; worker-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src *; img-src * data: blob:; frame-src *;"
             elif setting["csp_unsafe_eval"] is True:
                 csp_header = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
             elif setting["csp_unsafe_eval"] is False:
