@@ -90,6 +90,8 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "timeout": setting.get("timeout", "120s"),
         "max_body_size": setting.get("max-body-size", "10m"),
         "allowed_paths": normalized_paths,
+        "proxy_buffering_off": setting.get("proxy-buffering-off", False),
+        "proxy_cache_off": setting.get("proxy-cache-off", False),
     }
 
     # Parse forwarding address
@@ -131,6 +133,11 @@ def generate_location_blocks(
     indent: str = "        ",
 ) -> str:
     """Generate location blocks for allowed paths or main location."""
+    extra_proxy_directives = ""
+    if setting.get("proxy_buffering_off"):
+        extra_proxy_directives += f"\n{indent}    proxy_buffering off;"
+    if setting.get("proxy_cache_off"):
+        extra_proxy_directives += f"\n{indent}    proxy_cache off;"
     # If allowed-paths is specified, generate blocks only for those paths
     if setting["allowed_paths"]:
         location_blocks = []
@@ -145,7 +152,7 @@ def generate_location_blocks(
 {indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 {indent}    proxy_set_header X-Forwarded-Proto $scheme;
 {indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}
+{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
 
 {indent}    # Timeouts
 {indent}    proxy_connect_timeout {timeout};
@@ -161,7 +168,7 @@ def generate_location_blocks(
 {indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 {indent}    proxy_set_header X-Forwarded-Proto $scheme;
 {indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}
+{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
 
 {indent}    # Timeouts
 {indent}    proxy_connect_timeout {timeout};
@@ -190,7 +197,7 @@ def generate_location_blocks(
 {indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 {indent}    proxy_set_header X-Forwarded-Proto $scheme;
 {indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}
+{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
 
 {indent}    # Timeouts
 {indent}    proxy_connect_timeout {timeout};
@@ -267,6 +274,13 @@ def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";"""
 
+        # Extra proxy directives
+        extra_proxy_directives = ""
+        if setting["proxy_buffering_off"]:
+            extra_proxy_directives += "\n            proxy_buffering off;"
+        if setting["proxy_cache_off"]:
+            extra_proxy_directives += "\n            proxy_cache off;"
+
         forward_block = f"""    # {domain} - HTTP forwarding to {setting["host"]}:{setting["port"]}
     server {{
         listen 80;
@@ -335,6 +349,13 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";"""
 
+    # Extra proxy directives
+    extra_proxy_directives = ""
+    if setting["proxy_buffering_off"]:
+        extra_proxy_directives += "\n            proxy_buffering off;"
+    if setting["proxy_cache_off"]:
+        extra_proxy_directives += "\n            proxy_cache off;"
+
     # Rate limiting locations
     rate_limit_locations = ""
     if setting["rate_limit"]:
@@ -366,7 +387,7 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header X-Forwarded-Host $host;
-            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}
+            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
 
             # Timeouts
             proxy_connect_timeout {setting["timeout"]};
@@ -391,7 +412,7 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header X-Forwarded-Host $host;
-            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}
+            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
 
             # Timeouts
             proxy_connect_timeout {setting["timeout"]};
