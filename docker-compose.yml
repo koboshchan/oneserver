@@ -18,3 +18,12 @@ services:
 networks:
   oneserver_bridge:
       name: oneserver_bridge
+
+# to add servers to the network, add the following to the server's container service definition:
+# networks:
+#   - oneserver_bridge
+
+# and connect the compose project to the bridge network with the following configuration:
+# networks:
+#   oneserver_bridge:
+#     external: true
