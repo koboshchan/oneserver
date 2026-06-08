@@ -13,10 +13,19 @@ import urllib.parse
 
 
 def load_settings(file_path: str) -> List[Dict[str, Any]]:
-    """Load settings safely from JSON file."""
+    """Load settings safely from JSON file, stripping comments if present."""
     try:
         with open(file_path, "r") as f:
-            settings = json.load(f)
+            content = f.read()
+        
+        # Simple comment stripping (//)
+        lines = []
+        for line in content.splitlines():
+            if "//" in line:
+                line = line.split("//")[0]
+            lines.append(line)
+        
+        settings = json.loads("\n".join(lines))
 
         if not isinstance(settings, list):
             raise ValueError("Settings must be a list of domain configurations")
@@ -82,6 +91,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "allowed_paths": normalized_paths,
         "proxy_buffering_off": setting.get("proxy-buffering-off", False),
         "proxy_cache_off": setting.get("proxy-cache-off", False),
+        "service": setting.get("service", "").strip(),
     }
 
     # Robust URL/host/port extraction handling IPv6 addresses seamlessly
@@ -304,8 +314,33 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     gzip_vary on;
     gzip_types text/plain text/css application/json application/x-javascript application/javascript text/xml application/xml application/rss+xml text/javascript image/svg+xml application/vnd.ms-fontobject application/x-font-ttf font/opentype;"""
 
-    ssl_servers = [generate_ssl_server_block(s) for s in settings if s["type"] in ["https", "https-only"]]
+    # Separate standard configurations from custom service templates
+    standard_settings = [s for s in settings if not s["service"]]
+    service_blocks = []
+
+    for s in settings:
+        if s["service"]:
+            template_path = Path("services") / f"{s['service']}.conf"
+            if template_path.exists():
+                with open(template_path, "r") as f:
+                    template = f.read()
+                
+                ssl_cert = f"/etc/nginx/ssl/{s['ca_bundle']}" if s['ca_bundle'] else f"/etc/nginx/ssl/{s['domain']}/fullchain.pem"
+                ssl_key = f"/etc/nginx/ssl/{s['private_key']}" if s['private_key'] else f"/etc/nginx/ssl/{s['domain']}/privkey.pem"
+                
+                block = template.replace("{{domain}}", s["domain"]) \
+                                .replace("{{upstream_name}}", s["upstream_name"]) \
+                                .replace("{{ssl_cert}}", ssl_cert) \
+                                .replace("{{ssl_key}}", ssl_key) \
+                                .replace("{{max_body_size}}", s["max_body_size"]) \
+                                .replace("{{host}}", s["host"]) \
+                                .replace("{{port}}", str(s["port"]))
+                service_blocks.append(f"    # Custom Service: {s['service']}\n{block}")
+
+    ssl_servers = [generate_ssl_server_block(s) for s in standard_settings if s["type"] in ["https", "https-only"]]
     ssl_servers_text = "\n\n".join(ssl_servers) if ssl_servers else ""
+    
+    service_servers_text = "\n\n".join(service_blocks) if service_blocks else ""
 
     return f"""events {{
     worker_connections 1024;
@@ -339,9 +374,11 @@ http {{
     # Upstream Definitions
 {generate_upstream_blocks(settings)}
 
-{generate_http_redirect_server(settings)}
+{generate_http_redirect_server(standard_settings)}
 
 {ssl_servers_text}
+
+{service_servers_text}
 }}"""
 
 

@@ -302,6 +302,7 @@
                     { key: 'csp-wildcard', label: 'CSP Wildcard', type: 'checkbox' },
                     { key: 'proxy-buffering-off', label: 'Proxy Buffering Off', type: 'checkbox' },
                     { key: 'proxy-cache-off', label: 'Proxy Cache Off', type: 'checkbox' },
+                    { key: 'service', label: 'Service Template', type: 'text' },
                     { key: 'max-body-size', label: 'Max Body Size', type: 'text' },
                     { key: 'timeout', label: 'Timeout', type: 'text' }
                 ];
@@ -404,7 +405,8 @@
                 type: "https-only",
                 websocket: true,
                 compression: true,
-                "security-headers": true
+                "security-headers": true,
+                service: ""
             });
             renderEditor();
         }
