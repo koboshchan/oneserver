@@ -2,19 +2,18 @@
 """
 Nginx Proxy Configuration Generator
 Converts settings.json to nginx-proxy.conf
-
-Usage: python generate_nginx_config.py [--input settings.json] [--output nginx-proxy.conf]
 """
 
 import json
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
+import urllib.parse
 
 
 def load_settings(file_path: str) -> List[Dict[str, Any]]:
-    """Load settings from JSON file."""
+    """Load settings safely from JSON file."""
     try:
         with open(file_path, "r") as f:
             settings = json.load(f)
@@ -32,48 +31,40 @@ def load_settings(file_path: str) -> List[Dict[str, Any]]:
 
 
 def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and normalize a single domain setting."""
+    """Validate, normalize, and safely parse domain parameters."""
     required_fields = ["domain", "forwarding"]
 
     for field in required_fields:
         if field not in setting:
-            raise ValueError(
-                f"Missing required field '{field}' in domain configuration"
-            )
+            raise ValueError(f"Missing required field '{field}' in domain configuration")
 
-    # Handle rate-limit (can be number or object)
+    # Normalize rate-limit format
     rate_limit = setting.get("rate-limit", {})
     if isinstance(rate_limit, (int, float)):
-        # Convert number to object format for consistency
         rate_limit = {"/": rate_limit}
     elif not isinstance(rate_limit, dict):
         rate_limit = {}
 
-    # Validate type field
     connection_type = setting.get("type", "https-only")
     if connection_type not in ["http", "https", "https-only"]:
-        raise ValueError(
-            f"Invalid type '{connection_type}'. Must be 'http', 'https', or 'https-only'"
-        )
+        raise ValueError(f"Invalid type '{connection_type}'. Must be 'http', 'https', or 'https-only'")
 
-    # Validate allowed-paths
+    # Normalize allowed-paths safely
     allowed_paths = setting.get("allowed-paths", [])
     if not isinstance(allowed_paths, list):
         raise ValueError("'allowed-paths' must be a list of path strings")
 
-    # Normalize paths (ensure they start with / and don't end with /)
     normalized_paths = []
     for path in allowed_paths:
         if not isinstance(path, str):
             raise ValueError("All entries in 'allowed-paths' must be strings")
-        normalized_path = path.strip()
-        if not normalized_path.startswith("/"):
-            normalized_path = "/" + normalized_path
-        if len(normalized_path) > 1 and normalized_path.endswith("/"):
-            normalized_path = normalized_path.rstrip("/")
-        normalized_paths.append(normalized_path)
+        p = path.strip()
+        if not p.startswith("/"):
+            p = "/" + p
+        if len(p) > 1 and p.endswith("/"):
+            p = p.rstrip("/")
+        normalized_paths.append(p)
 
-    # Set defaults
     validated = {
         "domain": setting["domain"].strip(),
         "forwarding": setting["forwarding"].strip(),
@@ -84,9 +75,8 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "websocket": setting.get("websocket", True),
         "compression": setting.get("compression", True),
         "security_headers": setting.get("security-headers", True),
-        "csp_unsafe_eval": setting.get("csp-unsafe-eval")
-        or setting.get("csp_unsafe_eval"),
-        "csp_wildcard": setting.get("csp-wildcard") or setting.get("csp_wildcard"),
+        "csp_unsafe_eval": setting.get("csp-unsafe-eval") or setting.get("csp_unsafe_eval", False),
+        "csp_wildcard": setting.get("csp-wildcard") or setting.get("csp_wildcard", False),
         "timeout": setting.get("timeout", "120s"),
         "max_body_size": setting.get("max-body-size", "10m"),
         "allowed_paths": normalized_paths,
@@ -94,338 +84,202 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "proxy_cache_off": setting.get("proxy-cache-off", False),
     }
 
-    # Parse forwarding address
-    if ":" in validated["forwarding"]:
-        host, port = validated["forwarding"].split(":", 1)
-        validated["host"] = host
-        validated["port"] = int(port)
-    else:
-        validated["host"] = validated["forwarding"]
-        validated["port"] = 80
+    # Robust URL/host/port extraction handling IPv6 addresses seamlessly
+    forwarding_target = validated["forwarding"]
+    if not (forwarding_target.startswith("http://") or forwarding_target.startswith("https://")):
+        forwarding_target = f"http://{forwarding_target}"
+    
+    try:
+        parsed_url = urllib.parse.urlparse(forwarding_target)
+        validated["host"] = parsed_url.hostname if parsed_url.hostname else "127.0.0.1"
+        # Preserve bracket formatting if it is an explicit IPv6 string literal
+        if ":" in validated["host"] and not validated["host"].startswith("["):
+            validated["host"] = f"[{validated['host']}]"
+        validated["port"] = parsed_url.port if parsed_url.port else 80
+    except Exception:
+        raise ValueError(f"Could not parse forwarding target address: {validated['forwarding']}")
 
-    # Generate upstream name
-    validated["upstream_name"] = (
-        validated["domain"].replace(".", "_").replace("-", "_") + "_backend"
-    )
-
+    validated["upstream_name"] = validated["domain"].replace(".", "_").replace("-", "_") + "_backend"
     return validated
 
 
-def generate_upstream_blocks(settings: List[Dict[str, Any]]) -> str:
-    """Generate upstream server blocks."""
-    upstreams = []
+def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str = "") -> str:
+    """Consolidate generation logic to avoid code repetition across routes."""
+    lines = [
+        f"{indent}proxy_pass http://{setting['upstream_name']};",
+        f"{indent}proxy_set_header Host $host;",
+        f"{indent}proxy_set_header X-Real-IP $remote_addr;",
+        f"{indent}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+        f"{indent}proxy_set_header X-Forwarded-Proto $scheme;",
+        f"{indent}proxy_set_header X-Forwarded-Host $host;",
+        f"{indent}proxy_set_header X-Forwarded-Port $server_port;"
+    ]
 
-    for setting in settings:
-        upstream = f"""    upstream {setting["upstream_name"]} {{
-        server {setting["host"]}:{setting["port"]};
-        keepalive 32;
-    }}"""
-        upstreams.append(upstream)
+    if rate_zone:
+        lines.insert(0, f"{indent}limit_req zone={rate_zone} burst=5 nodelay;")
 
-    return "\n\n".join(upstreams)
+    if setting["websocket"]:
+        lines.extend([
+            f"{indent}proxy_http_version 1.1;",
+            f"{indent}proxy_set_header Upgrade $http_upgrade;",
+            f"{indent}proxy_set_header Connection \"upgrade\";"
+        ])
+
+    if setting["proxy_buffering_off"]:
+        lines.append(f"{indent}proxy_buffering off;")
+    if setting["proxy_cache_off"]:
+        lines.append(f"{indent}proxy_cache off;")
+
+    lines.extend([
+        f"{indent}proxy_connect_timeout {setting['timeout']};",
+        f"{indent}proxy_send_timeout {setting['timeout']};",
+        f"{indent}proxy_read_timeout {setting['timeout']};"
+    ])
+    return "\n".join(lines)
 
 
-def generate_location_blocks(
-    setting: Dict[str, Any],
-    upstream_name: str,
-    websocket_headers: str,
-    timeout: str,
-    indent: str = "        ",
-) -> str:
-    """Generate location blocks for allowed paths or main location."""
-    extra_proxy_directives = ""
-    if setting.get("proxy_buffering_off"):
-        extra_proxy_directives += f"\n{indent}    proxy_buffering off;"
-    if setting.get("proxy_cache_off"):
-        extra_proxy_directives += f"\n{indent}    proxy_cache off;"
-    # If allowed-paths is specified, generate blocks only for those paths
-    if setting["allowed_paths"]:
-        location_blocks = []
+def generate_security_headers(setting: Dict[str, Any], indent: str = "        ") -> str:
+    """Build standardized, robust security headers."""
+    if not setting["security_headers"]:
+        return ""
 
-        # Generate location blocks for each allowed path
-        for path in setting["allowed_paths"]:
-            location_block = f"""{indent}# Allow access to {path}
-{indent}location ^~ {path}/ {{
-{indent}    proxy_pass http://{upstream_name};
-{indent}    proxy_set_header Host $host;
-{indent}    proxy_set_header X-Real-IP $remote_addr;
-{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-{indent}    proxy_set_header X-Forwarded-Proto $scheme;
-{indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
+    headers = [
+        f'{indent}add_header X-Frame-Options "SAMEORIGIN" always;',
+        f'{indent}add_header X-XSS-Protection "1; mode=block" always;',
+        f'{indent}add_header X-Content-Type-Options "nosniff" always;',
+        f'{indent}add_header Referrer-Policy "no-referrer-when-downgrade" always;'
+    ]
 
-{indent}    # Timeouts
-{indent}    proxy_connect_timeout {timeout};
-{indent}    proxy_send_timeout {timeout};
-{indent}    proxy_read_timeout {timeout};
-{indent}}}
-{indent}
-{indent}# Allow exact path matches
-{indent}location = {path} {{
-{indent}    proxy_pass http://{upstream_name};
-{indent}    proxy_set_header Host $host;
-{indent}    proxy_set_header X-Real-IP $remote_addr;
-{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-{indent}    proxy_set_header X-Forwarded-Proto $scheme;
-{indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
-
-{indent}    # Timeouts
-{indent}    proxy_connect_timeout {timeout};
-{indent}    proxy_send_timeout {timeout};
-{indent}    proxy_read_timeout {timeout};
-{indent}}}"""
-            location_blocks.append(location_block)
-
-        # Add catch-all 404 for non-allowed paths
-        catch_all_block = f"""
-{indent}# Block all other paths
-{indent}location / {{
-{indent}    return 404;
-{indent}}}"""
-        location_blocks.append(catch_all_block)
-
-        return "\n\n".join(location_blocks)
+    csp = ""
+    if setting["csp_wildcard"]:
+        csp = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; worker-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src *; img-src * data: blob:; frame-src *;"
+    elif setting["csp_unsafe_eval"]:
+        csp = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data: blob:; default-src 'self' http: https: data: blob: 'unsafe-inline';"
     else:
-        # Original behavior - allow all paths
-        return f"""
-{indent}# Main application
-{indent}location / {{
-{indent}    proxy_pass http://{upstream_name};
-{indent}    proxy_set_header Host $host;
-{indent}    proxy_set_header X-Real-IP $remote_addr;
-{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-{indent}    proxy_set_header X-Forwarded-Proto $scheme;
-{indent}    proxy_set_header X-Forwarded-Host $host;
-{indent}    proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
+        csp = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline';"
 
-{indent}    # Timeouts
-{indent}    proxy_connect_timeout {timeout};
-{indent}    proxy_send_timeout {timeout};
-{indent}    proxy_read_timeout {timeout};
-{indent}}}"""
+    if csp:
+        headers.append(f'{indent}add_header Content-Security-Policy "{csp}" always;')
+
+    return "\n" + "\n".join(headers)
+
+
+def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ") -> str:
+    """
+    Unified path router logic. Evaluates and merges constraints gracefully 
+    to completely circumvent potential duplicate location rules inside Nginx blocks.
+    """
+    blocks = []
+    
+    # Process rate-limit parameters mapped to distinct locations
+    processed_limits: Dict[str, str] = {}
+    for path, rate in setting["rate_limit"].items():
+        if rate > 0:
+            zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone"
+            processed_limits[path] = zone_name.replace("__", "_").strip("_")
+
+    # Context A: Target constraints specified explicitly via allowed_paths whitelist
+    if setting["allowed_paths"]:
+        for path in setting["allowed_paths"]:
+            rate_zone = processed_limits.get(path, "")
+            
+            # Directory / Subpath catch matches
+            blocks.append(f"{indent}location ^~ {path}/ {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone)}\n{indent}}}")
+            # Literal Route Matches
+            blocks.append(f"{indent}location = {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone)}\n{indent}}}")
+        
+        # Deny unauthorized access patterns explicitly
+        blocks.append(f"{indent}location / {{\n{indent}    return 404;\n{indent}}}")
+        return "\n\n".join(blocks)
+
+    # Context B: Standard deployment structure mixed with arbitrary standalone rate-limiting zones
+    all_defined_paths: Set[str] = set(processed_limits.keys())
+    
+    # Sort paths carefully: longest string literal rules take priority structural parsing sequence
+    for path in sorted(all_defined_paths, key=lambda x: (-len(x), x)):
+        if path == "/":
+            continue
+        rate_zone = processed_limits[path]
+        loc_modifier = "~ " if "*" in path else ""
+        clean_path = path.replace("*", ".*") if "*" in path else path
+        
+        blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone)}\n{indent}}}")
+
+    # Fallback primary route block location targeting context root "/"
+    root_rate_zone = processed_limits.get("/", "")
+    blocks.append(f"{indent}location / {{\n{build_proxy_pass_block(setting, indent + '    ', root_rate_zone)}\n{indent}}}")
+
+    return "\n\n".join(blocks)
+
+
+def generate_upstream_blocks(settings: List[Dict[str, Any]]) -> str:
+    """Generate independent upstream server block allocations cleanly mapped for individual profiles."""
+    return "\n\n".join([
+        f"    upstream {s['upstream_name']} {{\n        server {s['host']}:{s['port']};\n        keepalive 32;\n    }}"
+        for s in settings
+    ])
+
+
+def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
+    """Build shared memory limits allocating proportional slots directly based on rulesets."""
+    zones = []
+    for s in settings:
+        domain_safe = s["domain"].replace(".", "_").replace("-", "_")
+        for path, rate in s["rate_limit"].items():
+            if rate > 0:
+                zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone".replace("__", "_").strip("_")
+                zones.append(f"    limit_req_zone $binary_remote_addr zone={zone_name}:10m rate={int(rate)}r/m;")
+    return "\n    # Rate limiting zones\n" + "\n".join(zones) if zones else ""
 
 
 def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
-    """Generate HTTP server blocks for redirect or forwarding."""
-    # Separate domains by HTTP handling preference
+    """Generate universal port 80 routing behaviors supporting structural certificate lifecycle requests."""
     redirect_domains = [s["domain"] for s in settings if s["type"] == "https-only"]
     forward_settings = [s for s in settings if s["type"] in ["http", "https"]]
-
     blocks = []
 
-    # HTTP to HTTPS redirect server for domains that don't allow HTTP forwarding
     if redirect_domains:
-        domain_list = " ".join(redirect_domains)
-        redirect_block = f"""    # HTTP to HTTPS redirect
+        blocks.append(f"""    # HTTP to HTTPS redirect
     server {{
         listen 80;
-        server_name {domain_list};
+        server_name {" ".join(redirect_domains)};
 
-        # Allow Let's Encrypt ACME challenge
         location /.well-known/acme-challenge/ {{
             root /var/www/certbot;
         }}
 
-        # Redirect all other traffic to HTTPS
         location / {{
             return 301 https://$host$request_uri;
         }}
-    }}"""
-        blocks.append(redirect_block)
+    }}""")
 
-    # HTTP forwarding servers for domains that allow HTTP
-    for setting in forward_settings:
-        domain = setting["domain"]
-        upstream_name = setting["upstream_name"]
-
-        # Security headers
-        security_headers = ""
-        if setting["security_headers"]:
-            csp_header = ""
-            if setting["csp_wildcard"] is True:
-                csp_header = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; worker-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src *; img-src * data: blob:; frame-src *;"
-            elif setting["csp_unsafe_eval"] is True:
-                csp_header = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
-            elif setting["csp_unsafe_eval"] is False:
-                csp_header = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
-
-            security_headers = """
-
-        # Security headers
-        add_header X-Frame-Options "SAMEORIGIN" always;
-        add_header X-XSS-Protection "1; mode=block" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header Referrer-Policy "no-referrer-when-downgrade" always;"""
-            if csp_header:
-                security_headers += (
-                    '''
-        add_header Content-Security-Policy "'''
-                    + csp_header
-                    + """" always;"""
-                )
-
-        # WebSocket support
-        websocket_headers = ""
-        if setting["websocket"]:
-            websocket_headers = """
-            # WebSocket support
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";"""
-
-        # Extra proxy directives
-        extra_proxy_directives = ""
-        if setting["proxy_buffering_off"]:
-            extra_proxy_directives += "\n            proxy_buffering off;"
-        if setting["proxy_cache_off"]:
-            extra_proxy_directives += "\n            proxy_cache off;"
-
-        forward_block = f"""    # {domain} - HTTP forwarding to {setting["host"]}:{setting["port"]}
+    for s in forward_settings:
+        domain_safe = s["domain"].replace(".", "_").replace("-", "_")
+        blocks.append(f"""    # {s['domain']} - HTTP Core Forwarding
     server {{
         listen 80;
-        server_name {domain};
+        server_name {s['domain']};
+        client_max_body_size {s['max_body_size']};{generate_security_headers(s)}
 
-        # Maximum request body size
-        client_max_body_size {setting["max_body_size"]};{security_headers}
-
-        # Allow Let's Encrypt ACME challenge
         location /.well-known/acme-challenge/ {{
             root /var/www/certbot;
         }}
 
-        # Forward traffic to backend{generate_location_blocks(setting, upstream_name, websocket_headers, setting["timeout"])}
-    }}"""
-        blocks.append(forward_block)
+{generate_routes(s, domain_safe)}
+    }}""")
 
     return "\n\n".join(blocks)
 
 
 def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
-    """Generate SSL server block for a domain."""
+    """Generate comprehensive production-hardened TLS context configuration parameters."""
     domain = setting["domain"]
-    upstream_name = setting["upstream_name"]
+    domain_safe = domain.replace(".", "_").replace("-", "_")
+    
+    ssl_cert = f"/etc/nginx/ssl/{setting['ca_bundle']}" if setting["ca_bundle"] else f"/etc/nginx/ssl/{domain}/fullchain.pem"
+    ssl_key = f"/etc/nginx/ssl/{setting['private_key']}" if setting["private_key"] else f"/etc/nginx/ssl/{domain}/privkey.pem"
 
-    # SSL certificate paths
-    if setting["ca_bundle"] and setting["private_key"]:
-        ssl_cert = f"/etc/nginx/ssl/{setting['ca_bundle']}"
-        ssl_key = f"/etc/nginx/ssl/{setting['private_key']}"
-    else:
-        # Default Let's Encrypt style paths
-        ssl_cert = f"/etc/nginx/ssl/{domain}/fullchain.pem"
-        ssl_key = f"/etc/nginx/ssl/{domain}/privkey.pem"
-
-    # Security headers
-    security_headers = ""
-    if setting["security_headers"]:
-        csp_header = ""
-        if setting["csp_wildcard"] is True:
-            csp_header = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;"
-        elif setting["csp_unsafe_eval"] is True:
-            csp_header = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
-        elif setting["csp_unsafe_eval"] is False:
-            csp_header = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline'"
-
-        security_headers = """
-        # Security headers
-        add_header X-Frame-Options "SAMEORIGIN" always;
-        add_header X-XSS-Protection "1; mode=block" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header Referrer-Policy "no-referrer-when-downgrade" always;"""
-        if csp_header:
-            security_headers += (
-                '''
-        add_header Content-Security-Policy "'''
-                + csp_header
-                + """" always;"""
-            )
-
-    # WebSocket support
-    websocket_headers = ""
-    if setting["websocket"]:
-        websocket_headers = """
-            # WebSocket support
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";"""
-
-    # Extra proxy directives
-    extra_proxy_directives = ""
-    if setting["proxy_buffering_off"]:
-        extra_proxy_directives += "\n            proxy_buffering off;"
-    if setting["proxy_cache_off"]:
-        extra_proxy_directives += "\n            proxy_cache off;"
-
-    # Rate limiting locations
-    rate_limit_locations = ""
-    if setting["rate_limit"]:
-        domain_safe = domain.replace(".", "_").replace("-", "_")
-        locations = []
-
-        # Sort paths by specificity (longer/more specific first)
-        sorted_paths = sorted(
-            setting["rate_limit"].items(), key=lambda x: (-len(x[0]), x[0])
-        )
-
-        for path, rate in sorted_paths:
-            if rate > 0:
-                zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone"
-                zone_name = zone_name.replace("__", "_").strip("_")
-
-                # Convert nginx-style wildcards
-                nginx_path = path.replace("*", ".*")
-                location_type = "~ " if "*" in path else ""
-
-                location_block = f"""
-        # Rate limited: {rate} requests/minute for {path}
-        location {location_type}{nginx_path} {{
-            limit_req zone={zone_name} burst=5 nodelay;
-
-            proxy_pass http://{upstream_name};
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header X-Forwarded-Host $host;
-            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
-
-            # Timeouts
-            proxy_connect_timeout {setting["timeout"]};
-            proxy_send_timeout {setting["timeout"]};
-            proxy_read_timeout {setting["timeout"]};
-        }}"""
-                locations.append(location_block)
-
-        rate_limit_locations = "".join(locations)
-
-    # Main location block (only if no rate limiting or no root path rate limit and no allowed-paths restriction)
-    main_location = ""
-    if not setting["rate_limit"] or "/" not in setting["rate_limit"]:
-        if not setting["allowed_paths"]:
-            # Only generate default location block if no allowed-paths restriction
-            main_location = f"""
-        # Main application
-        location / {{
-            proxy_pass http://{upstream_name};
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header X-Forwarded-Host $host;
-            proxy_set_header X-Forwarded-Port $server_port;{websocket_headers}{extra_proxy_directives}
-
-            # Timeouts
-            proxy_connect_timeout {setting["timeout"]};
-            proxy_send_timeout {setting["timeout"]};
-            proxy_read_timeout {setting["timeout"]};
-        }}"""
-        else:
-            # Generate allowed-paths location blocks
-            main_location = generate_location_blocks(
-                setting, upstream_name, websocket_headers, setting["timeout"]
-            )
-
-    server_block = f"""    # {domain} - Forward to {setting["host"]}:{setting["port"]}
+    return f"""    # {domain} - Production TLS Context
     server {{
         listen 443 ssl;
         http2 on;
@@ -433,43 +287,16 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
 
         ssl_certificate {ssl_cert};
         ssl_certificate_key {ssl_key};
+        client_max_body_size {setting['max_body_size']};{generate_security_headers(setting)}
 
-        # Maximum request body size
-        client_max_body_size {setting["max_body_size"]};{security_headers}{main_location}{rate_limit_locations}
+{generate_routes(setting, domain_safe)}
     }}"""
-
-    return server_block
-
-
-def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
-    """Generate rate limiting zones for nginx."""
-    zones = []
-
-    for setting in settings:
-        domain_safe = setting["domain"].replace(".", "_").replace("-", "_")
-
-        for path, rate in setting["rate_limit"].items():
-            if rate > 0:  # Only create zones for positive rates
-                zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone"
-                zone_name = zone_name.replace("__", "_").strip("_")
-                zones.append(
-                    f"    limit_req_zone $binary_remote_addr zone={zone_name}:10m rate={int(rate)}r/m;"
-                )
-
-    if zones:
-        return "\n    # Rate limiting zones\n" + "\n".join(zones)
-    return ""
 
 
 def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
-    """Generate complete nginx configuration."""
-
-    # Check if compression is enabled for any domain
-    compression_enabled = any(s["compression"] for s in settings)
-
-    # Gzip configuration
+    """Compile global unified definitions framework orchestrating secondary modular dependencies."""
     gzip_config = ""
-    if compression_enabled:
+    if any(s["compression"] for s in settings):
         gzip_config = """
     # Gzip compression
     gzip on;
@@ -477,28 +304,10 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     gzip_vary on;
     gzip_types text/plain text/css application/json application/x-javascript application/javascript text/xml application/xml application/rss+xml text/javascript image/svg+xml application/vnd.ms-fontobject application/x-font-ttf font/opentype;"""
 
-    # Rate limiting zones
-    rate_limit_zones = generate_rate_limit_zones(settings)
-
-    # Generate upstream blocks
-    upstream_blocks = generate_upstream_blocks(settings)
-
-    # Generate HTTP server blocks (redirect or forward)
-    http_servers = ""
-    if settings:
-        http_servers = generate_http_redirect_server(settings)
-
-    # Generate SSL server blocks
-    ssl_servers = []
-    for setting in settings:
-        if setting["type"] in ["https", "https-only"]:
-            ssl_servers.append(generate_ssl_server_block(setting))
-
-    # Join SSL servers with double newlines
+    ssl_servers = [generate_ssl_server_block(s) for s in settings if s["type"] in ["https", "https-only"]]
     ssl_servers_text = "\n\n".join(ssl_servers) if ssl_servers else ""
 
-    # Complete configuration
-    config = f"""events {{
+    return f"""events {{
     worker_connections 1024;
 }}
 
@@ -506,7 +315,6 @@ http {{
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
 
-    # Logging
     log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                     '$status $body_bytes_sent "$http_referer" '
                     '"$http_user_agent" "$http_x_forwarded_for"';
@@ -514,89 +322,55 @@ http {{
     access_log /var/log/nginx/access.log main;
     error_log /var/log/nginx/error.log;
 
-    # Basic settings
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
     keepalive_timeout 65;
     types_hash_max_size 2048;
-    server_names_hash_bucket_size 128;{gzip_config}{rate_limit_zones}
+    server_names_hash_bucket_size 128;{gzip_config}{generate_rate_limit_zones(settings)}
 
-    # SSL configuration
+    # Production SSL Hardening Context Parameters
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
     ssl_prefer_server_ciphers on;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    # Upstream servers
-{upstream_blocks}
+    # Upstream Definitions
+{generate_upstream_blocks(settings)}
 
-{http_servers}
+{generate_http_redirect_server(settings)}
 
 {ssl_servers_text}
 }}"""
 
-    return config
-
 
 def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(
-        description="Generate nginx proxy configuration from settings.json"
-    )
-    parser.add_argument(
-        "--input",
-        "-i",
-        default="settings.json",
-        help="Input settings file (default: settings.json)",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        default="nginx-proxy.conf",
-        help="Output nginx config file (default: nginx-proxy.conf)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print configuration to stdout instead of writing to file",
-    )
+    parser = argparse.ArgumentParser(description="Generate production nginx proxy configurations safely from standard settings schema matrices.")
+    parser.add_argument("--input", "-i", default="settings.json", help="Input parameters schema source path mapping.")
+    parser.add_argument("--output", "-o", default="nginx-proxy.conf", help="Target assembly destination file output path.")
+    parser.add_argument("--dry-run", action="store_true", help="Output stream raw string asset evaluation dumps to standard stdout instead.")
 
     args = parser.parse_args()
-
-    # Load and validate settings
     settings_data = load_settings(args.input)
 
     try:
-        validated_settings = [validate_setting(setting) for setting in settings_data]
+        validated_settings = [validate_setting(s) for s in settings_data]
     except ValueError as e:
-        print(f"Error: {e}")
+        print(f"Validation Operational Error: {e}")
         sys.exit(1)
 
-    # Generate configuration
     nginx_config = generate_nginx_config(validated_settings)
 
     if args.dry_run:
         print(nginx_config)
     else:
-        # Write to file
         try:
             with open(args.output, "w") as f:
                 f.write(nginx_config)
-            print(f"✅ Nginx configuration generated successfully: {args.output}")
-            print(f"📁 Configured {len(validated_settings)} domain(s):")
-            for setting in validated_settings:
-                type_status = {
-                    "http": "🔓 HTTP only",
-                    "https": "🔒 HTTPS + HTTP forwarding",
-                    "https-only": "🔒 HTTPS only (HTTP redirects)",
-                }[setting["type"]]
-                print(
-                    f"   - {setting['domain']} → {setting['host']}:{setting['port']} ({type_status})"
-                )
+            print(f"\033[92m\u2714 Nginx proxy mapping generated successfully to: {args.output}\033[0m")
         except IOError as e:
-            print(f"Error writing to '{args.output}': {e}")
+            print(f"Disk Write Operational Error payload anomaly observed on out-stream: {e}")
             sys.exit(1)
 
 

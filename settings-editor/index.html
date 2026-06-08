@@ -94,8 +94,8 @@
 
         .field-group {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 15px;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 12px;
         }
 
         .field {
@@ -290,10 +290,18 @@
                 const commonFields = [
                     { key: 'domain', label: 'Domain', type: 'text' },
                     { key: 'forwarding', label: 'Forwarding', type: 'text' },
-                    { key: 'type', label: 'Type', type: 'select', options: ['https', 'http'] },
+                    { key: 'type', label: 'Type', type: 'select', options: ['https-only', 'https', 'http'] },
                     { key: 'ca-bundle', label: 'CA Bundle', type: 'text' },
                     { key: 'private-key', label: 'Private Key', type: 'text' },
+                    { key: 'allowed-paths', label: 'Allowed Paths (JSON List)', type: 'json' },
+                    { key: 'rate-limit', label: 'Rate Limit (Num/Obj)', type: 'json' },
                     { key: 'websocket', label: 'Websocket', type: 'checkbox' },
+                    { key: 'compression', label: 'Compression', type: 'checkbox' },
+                    { key: 'security-headers', label: 'Security Headers', type: 'checkbox' },
+                    { key: 'csp-unsafe-eval', label: 'CSP Unsafe Eval', type: 'checkbox' },
+                    { key: 'csp-wildcard', label: 'CSP Wildcard', type: 'checkbox' },
+                    { key: 'proxy-buffering-off', label: 'Proxy Buffering Off', type: 'checkbox' },
+                    { key: 'proxy-cache-off', label: 'Proxy Cache Off', type: 'checkbox' },
                     { key: 'max-body-size', label: 'Max Body Size', type: 'text' },
                     { key: 'timeout', label: 'Timeout', type: 'text' }
                 ];
@@ -316,18 +324,34 @@
                             if (entry[field.key] === opt) o.selected = true;
                             input.appendChild(o);
                         });
+                    } else if (field.type === 'json') {
+                        input = document.createElement('input');
+                        input.type = 'text';
+                        input.value = typeof entry[field.key] === 'object' ? JSON.stringify(entry[field.key]) : (entry[field.key] || '');
                     } else {
                         input = document.createElement('input');
                         input.type = field.type;
                         if (field.type === 'checkbox') {
-                            input.checked = !!entry[field.key];
+                            input.checked = entry[field.key] !== undefined ? !!entry[field.key] : true; // Default to true if missing for most
+                            if (field.key.includes('off')) input.checked = !!entry[field.key]; // Default to false for "off" flags
                         } else {
                             input.value = entry[field.key] || '';
                         }
                     }
 
                     input.addEventListener('change', (e) => {
-                        const val = field.type === 'checkbox' ? e.target.checked : e.target.value;
+                        let val;
+                        if (field.type === 'checkbox') {
+                            val = e.target.checked;
+                        } else if (field.type === 'json') {
+                            try {
+                                val = JSON.parse(e.target.value);
+                            } catch {
+                                val = isNaN(e.target.value) ? e.target.value : Number(e.target.value);
+                            }
+                        } else {
+                            val = e.target.value;
+                        }
                         updateEntry(index, field.key, val);
                         if (field.key === 'domain') renderEditor(); // Update title
                     });
@@ -376,9 +400,11 @@
         function addNewEntry() {
             settingsData.push({
                 domain: "",
-                forwarding: "host.docker.internal:",
-                type: "https",
-                websocket: true
+                forwarding: "localhost:",
+                type: "https-only",
+                websocket: true,
+                compression: true,
+                "security-headers": true
             });
             renderEditor();
         }

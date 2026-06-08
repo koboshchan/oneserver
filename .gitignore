@@ -10,3 +10,6 @@ package-lock.json
 package.json
 
 settings.json
+
+__pycache__/
+*.pyc
