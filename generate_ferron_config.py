@@ -112,7 +112,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     return validated
 
 
-def generate_security_headers(setting: Dict[str, Any], indent: str = "  ") -> str:
+def generate_security_headers(setting: Dict[str, Any], indent: str = "  ", is_ssl: bool = False) -> str:
     """Build standardized, robust security headers in KDL format."""
     if not setting["security_headers"]:
         return ""
@@ -123,6 +123,9 @@ def generate_security_headers(setting: Dict[str, Any], indent: str = "  ") -> st
         f'{indent}header "X-Content-Type-Options" "nosniff"',
         f'{indent}header "Referrer-Policy" "no-referrer-when-downgrade"'
     ]
+
+    if is_ssl:
+        headers.append(f'{indent}header "Strict-Transport-Security" "max-age=31536000; includeSubDomains; preload"')
 
     csp = ""
     if setting["csp_wildcard"]:
@@ -209,7 +212,7 @@ def generate_ferron_config(settings: List[Dict[str, Any]]) -> str:
                 blocks.append("  auto_tls")
         
         # Security Headers
-        blocks.append(generate_security_headers(s))
+        blocks.append(generate_security_headers(s, is_ssl=True))
 
         # Rate Limiting
         for path, rate in s["rate_limit"].items():
@@ -243,8 +246,8 @@ def generate_ferron_config(settings: List[Dict[str, Any]]) -> str:
         blocks.append("}")
         blocks.append("")
 
-        # Handle HTTP to HTTPS redirect for https-only
-        if s["type"] == "https-only":
+        # Handle HTTP to HTTPS redirect
+        if s["type"] in ["https", "https-only"]:
             blocks.append(f'"{domain}:80" {{')
             blocks.append(f'  status 301 location="https://{domain}{{path_and_query}}"')
             blocks.append("}")

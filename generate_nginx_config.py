@@ -148,7 +148,7 @@ def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str 
     return "\n".join(lines)
 
 
-def generate_security_headers(setting: Dict[str, Any], indent: str = "        ") -> str:
+def generate_security_headers(setting: Dict[str, Any], indent: str = "        ", is_ssl: bool = False) -> str:
     """Build standardized, robust security headers."""
     if not setting["security_headers"]:
         return ""
@@ -159,6 +159,9 @@ def generate_security_headers(setting: Dict[str, Any], indent: str = "        ")
         f'{indent}add_header X-Content-Type-Options "nosniff" always;',
         f'{indent}add_header Referrer-Policy "no-referrer-when-downgrade" always;'
     ]
+
+    if is_ssl:
+        headers.append(f'{indent}add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;')
 
     csp = ""
     if setting["csp_wildcard"]:
@@ -244,8 +247,8 @@ def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
 
 def generate_http_redirect_server(settings: List[Dict[str, Any]]) -> str:
     """Generate universal port 80 routing behaviors supporting structural certificate lifecycle requests."""
-    redirect_domains = [s["domain"] for s in settings if s["type"] == "https-only"]
-    forward_settings = [s for s in settings if s["type"] in ["http", "https"]]
+    redirect_domains = [s["domain"] for s in settings if s["type"] in ["https", "https-only"]]
+    forward_settings = [s for s in settings if s["type"] == "http"]
     blocks = []
 
     if redirect_domains:
@@ -297,7 +300,7 @@ def generate_ssl_server_block(setting: Dict[str, Any]) -> str:
 
         ssl_certificate {ssl_cert};
         ssl_certificate_key {ssl_key};
-        client_max_body_size {setting['max_body_size']};{generate_security_headers(setting)}
+        client_max_body_size {setting['max_body_size']};{generate_security_headers(setting, is_ssl=True)}
 
 {generate_routes(setting, domain_safe)}
     }}"""
