@@ -1,0 +1,29 @@
+"{{domain}}" {
+  auto_tls
+  header "X-Content-Type-Options" "nosniff"
+  
+  // Custom headers for Jellyfin
+  header "Content-Security-Policy" "default-src https: data: blob: ; img-src 'self' https://* ; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://www.youtube.com blob:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; font-src 'self'"
+
+  location "/" {
+    proxy "{{upstream_url}}"
+    proxy_request_header "Host" "{header:Host}"
+    proxy_request_header "X-Real-IP" "{client_ip}"
+    proxy_request_header "X-Forwarded-For" "{header:X-Forwarded-For}, {client_ip}"
+    proxy_request_header "X-Forwarded-Proto" "{scheme}"
+    
+    // Proxy buffering off is not a direct KDL directive, 
+    // but Ferron is built on hyper/rustls which is extremely efficient for streaming.
+  }
+
+  location "/socket" {
+    proxy "{{upstream_url}}"
+    proxy_request_header "Upgrade" "{header:Upgrade}"
+    proxy_request_header "Connection" "upgrade"
+    proxy_request_header "Host" "{header:Host}"
+  }
+}
+
+"{{domain}}:80" {
+  status 301 location="https://{{domain}}{path_and_query}"
+}
