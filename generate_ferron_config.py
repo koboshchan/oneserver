@@ -48,7 +48,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Missing required field '{field}' in domain configuration")
 
     # Normalize rate-limit format
-    rate_limit = setting.get("rate-limit", {})
+    rate_limit = setting.get("rate-limit", setting.get("rate_limit", {}))
     if isinstance(rate_limit, (int, float)):
         rate_limit = {"/": rate_limit}
     elif not isinstance(rate_limit, dict):
@@ -59,7 +59,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Invalid type '{connection_type}'. Must be 'http', 'https', or 'https-only'")
 
     # Normalize allowed-paths safely
-    allowed_paths = setting.get("allowed-paths", [])
+    allowed_paths = setting.get("allowed-paths", setting.get("allowed_paths", []))
     if not isinstance(allowed_paths, list):
         raise ValueError("'allowed-paths' must be a list of path strings")
 
@@ -78,19 +78,19 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "domain": setting["domain"].strip(),
         "forwarding": setting["forwarding"].strip(),
         "type": connection_type,
-        "ca_bundle": setting.get("ca-bundle", ""),
-        "private_key": setting.get("private-key", ""),
+        "ca_bundle": setting.get("ca-bundle", setting.get("ca_bundle", "")),
+        "private_key": setting.get("private-key", setting.get("private_key", "")),
         "rate_limit": rate_limit,
         "websocket": setting.get("websocket", True),
         "compression": setting.get("compression", True),
-        "security_headers": setting.get("security-headers", True),
-        "csp_unsafe_eval": setting.get("csp-unsafe-eval") or setting.get("csp_unsafe_eval", False),
-        "csp_wildcard": setting.get("csp-wildcard") or setting.get("csp_wildcard", False),
+        "security_headers": setting.get("security-headers", setting.get("security_headers", True)),
+        "csp_unsafe_eval": setting.get("csp-unsafe-eval", setting.get("csp_unsafe_eval", False)) or False,
+        "csp_wildcard": setting.get("csp-wildcard", setting.get("csp_wildcard", False)) or False,
         "timeout": setting.get("timeout", "120s"),
-        "max_body_size": setting.get("max-body-size", "10m"),
+        "max_body_size": setting.get("max-body-size", setting.get("max_body_size", "10m")),
         "allowed_paths": normalized_paths,
-        "proxy_buffering_off": setting.get("proxy-buffering-off", False),
-        "proxy_cache_off": setting.get("proxy-cache-off", False),
+        "proxy_buffering_off": setting.get("proxy-buffering-off", setting.get("proxy_buffering_off", False)) or False,
+        "proxy_cache_off": setting.get("proxy-cache-off", setting.get("proxy_cache_off", False)) or False,
         "service": setting.get("service", "").strip(),
     }
 
