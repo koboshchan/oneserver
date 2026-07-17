@@ -215,6 +215,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "forward_url_path": setting.get("forward-url-path", setting.get("forward_url_path", False)),
         "path": normalized_paths_dict,
         "no_x_forwarded_for": setting.get("no-x-forwarded-for", setting.get("no_x_forwarded_for", False)),
+        "no_x_forwarded_host": setting.get("no-x-forwarded-host", setting.get("no_x_forwarded_host", False)),
     }
 
     # Extract hostname/port if not static and not redirect
@@ -232,7 +233,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             raise ValueError(f"Could not parse forwarding target address: {validated['forwarding']}")
         
-        validated["upstream_name"] = validated["domain"].replace(".", "_").replace("-", "_") + "_backend"
+        validated["upstream_name"] = validated["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_") + "_backend"
 
     return validated
 
@@ -251,8 +252,13 @@ def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str 
         ])
 
     lines.extend([
-        f"{indent}proxy_set_header X-Forwarded-Proto $scheme;",
-        f"{indent}proxy_set_header X-Forwarded-Host $host;",
+        f"{indent}proxy_set_header X-Forwarded-Proto $scheme;"
+    ])
+
+    if not setting.get("no_x_forwarded_host", False):
+        lines.append(f"{indent}proxy_set_header X-Forwarded-Host $host;")
+
+    lines.extend([
         f"{indent}proxy_set_header X-Forwarded-Port $server_port;"
     ])
 
@@ -513,7 +519,7 @@ def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
     """Build shared memory limits allocating proportional slots directly based on rulesets."""
     zones = []
     for s in settings:
-        domain_safe = s["domain"].replace(".", "_").replace("-", "_")
+        domain_safe = s["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_")
         for path, rate in s["rate_limit"].items():
             if rate > 0:
                 zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone".replace("__", "_").strip("_")
@@ -557,7 +563,7 @@ def generate_http_redirect_server(grouped_settings: Dict[str, List[Dict[str, Any
 
     for main_entry, handlers in http_domains:
         dom = main_entry["domain"]
-        domain_safe = dom.replace(".", "_").replace("-", "_")
+        domain_safe = dom.replace("*", "wildcard").replace(".", "_").replace("-", "_")
         gzip_toggle = "\n        gzip off;" if not main_entry["compression"] else ""
         
         error_directives = generate_error_page_directives(handlers, indent="        ")
@@ -591,7 +597,7 @@ def generate_http_redirect_server(grouped_settings: Dict[str, List[Dict[str, Any
 def generate_ssl_server_block(main_entry: Dict[str, Any], handlers: List[Dict[str, Any]]) -> str:
     """Generate comprehensive production-hardened TLS context configuration parameters."""
     domain = main_entry["domain"]
-    domain_safe = domain.replace(".", "_").replace("-", "_")
+    domain_safe = domain.replace("*", "wildcard").replace(".", "_").replace("-", "_")
     
     ssl_cert = f"/etc/nginx/ssl/{main_entry['ca_bundle']}" if main_entry["ca_bundle"] else f"/etc/nginx/ssl/{domain}/fullchain.pem"
     ssl_key = f"/etc/nginx/ssl/{main_entry['private_key']}" if main_entry["private_key"] else f"/etc/nginx/ssl/{domain}/privkey.pem"

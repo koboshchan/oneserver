@@ -86,6 +86,7 @@ Each domain configuration object in the settings array supports the following fi
 | `csp-unsafe-eval` | Boolean | `false` | Allows `unsafe-eval` in the Content Security Policy header. |
 | `csp-wildcard` | Boolean | `false` | Relaxes CSP constraints to allow wildcards in source mappings. |
 | `no-x-forwarded-for` | Boolean | `false` | If `true`, Nginx will omit the `X-Forwarded-For` and `X-Real-IP` proxy headers from requests to the backend. |
+| `no-x-forwarded-host` | Boolean | `false` | If `true`, Nginx will omit the `X-Forwarded-Host` proxy header from requests to the backend. |
 
 ### Performance & Limits
 | Field | Type | Default | Description |
@@ -101,7 +102,7 @@ Each domain configuration object in the settings array supports the following fi
 | `service` | String | `""` | Tag/identifier associated with the target backend service. |
 
 > [!NOTE]
-> Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`, `no_x_forwarded_for`, `forward_url_path`) are fully compatible and normalized automatically.
+> Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`, `no_x_forwarded_for`, `no_x_forwarded_host`, `forward_url_path`) are fully compatible and normalized automatically.
 
 ---
 
