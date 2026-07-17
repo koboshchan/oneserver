@@ -88,11 +88,14 @@ def load_settings(file_path: str) -> List[Dict[str, Any]]:
 
 def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     """Validate, normalize, and safely parse domain parameters."""
-    if "domain" not in setting:
-        raise ValueError("Missing required field 'domain' in domain configuration")
-    domain = setting["domain"].strip()
-
     connection_type = setting.get("type", "https-only")
+    if "domain" not in setting:
+        if ":" in connection_type:
+            domain = "*"
+        else:
+            raise ValueError("Missing required field 'domain' in domain configuration")
+    else:
+        domain = setting["domain"].strip()
     error_code = None
     if ":" in connection_type:
         parts = connection_type.split(":", 1)
@@ -626,6 +629,25 @@ def generate_ssl_server_block(main_entry: Dict[str, Any], handlers: List[Dict[st
 
 def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     """Compile global unified definitions framework orchestrating secondary modular dependencies."""
+    # Separate global error handlers (domain == "*") and actual domain settings
+    global_handlers = [s for s in settings if s["domain"] == "*"]
+    actual_settings = [s for s in settings if s["domain"] != "*"]
+    
+    actual_domains = {s["domain"] for s in actual_settings}
+    
+    merged_settings = list(actual_settings)
+    for dom in actual_domains:
+        dom_handlers = [s for s in actual_settings if s["domain"] == dom and s["error_code"] is not None]
+        dom_codes = {h["error_code"] for h in dom_handlers}
+        
+        for gh in global_handlers:
+            if gh["error_code"] not in dom_codes:
+                copied = gh.copy()
+                copied["domain"] = dom
+                merged_settings.append(copied)
+                
+    settings = merged_settings
+
     domains_map = {}
     for s in settings:
         dom = s["domain"]
