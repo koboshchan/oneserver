@@ -191,9 +191,9 @@ Error handlers can be configured per domain by prefixing the `type` with `{code}
 
 ---
 
-## Docker & Host Networking
+## Docker & Bridge Networking
 
-To support low-overhead forwarding and direct host port binding in Docker, `oneserver` runs in **host network mode** inside `docker-compose.yml`:
+To allow Nginx to natively resolve backend containers by their service names, `oneserver` runs attached to the `oneserver_bridge` network inside `docker-compose.yml`:
 
 ```yaml
 services:
@@ -202,16 +202,20 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: oneserver
-    network_mode: "host"
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
       - ${ONESERVER_PWD:-.}/cert:/etc/nginx/ssl:ro
       - ${ONESERVER_PWD:-.}/nginx-logs:/var/log/nginx
       - ${ONESERVER_PWD:-.}/public:/public:ro
     restart: unless-stopped
+    networks:
+      - oneserver_bridge
 ```
 
-> [!WARNING]
-> Since the container is running in `network_mode: "host"`, Nginx shares the host's networking stack directly. Avoid mapping `ports` in compose, and configure backend forwardings to point to `localhost:<port>` or `127.0.0.1:<port>`.
+> [!NOTE]
+> Other services (like your API backend or app containers) should join the external `oneserver_bridge` network. This enables Nginx to forward requests directly using their container name and port (e.g. `"forwarding": "api:8080"`).
 
 ---
 
