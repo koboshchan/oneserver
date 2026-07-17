@@ -1,68 +1,95 @@
 [
     {
-        // Required: domain name to proxy
+        // ==========================================
+        // 1. Standard Upstream Proxy (HTTPS only)
+        // ==========================================
         "domain": "app.example.com",
-        // Required: target server (format: "host:port" or "host", defaults to port 80)
         "forwarding": "localhost:3000",
-        // Optional: "http" (HTTP only), "https" (HTTP+HTTPS), "https-only" (HTTP redirects to HTTPS)
         "type": "https-only",
-        // Optional: SSL certificate bundle file name (if not provided, uses Let's Encrypt paths)
-        "ca-bundle": "app.example.com.crt",
-        // Optional: SSL private key file name (if not provided, uses Let's Encrypt paths)
-        "private-key": "app.example.com.key",
-        // Optional: Whitelist of allowed paths - only these paths will be forwarded, others return 404
-        // Example: ["/api", "/cdn"] allows /api/*, /cdn/*, but blocks /admin, /test, etc.
-        "allowed-paths": ["/api", "/cdn", "/public"],
-        // Optional: Rate limiting - object format for path-specific limits (requests per minute)
         "rate-limit": {
             "/api/auth/*": 10,
             "/api/*": 100,
-            "/uploads/*": 5,
             "/": 50
         },
-        // Optional: Enable WebSocket support - true (default) or false
         "websocket": true,
-        // Optional: Enable gzip compression - true (default) or false
         "compression": true,
-        // Optional: Add security headers (X-Frame-Options, X-XSS-Protection, etc.) - true (default) or false
         "security-headers": true,
-        // Optional: CSP header behavior - true (allow unsafe-eval), false (default CSP), null/omitted (no CSP header)
         "csp-unsafe-eval": false,
-        // Optional: Proxy timeout - format: "60s", "120s", "5m" (default: "120s")
         "timeout": "120s",
-        // Optional: Maximum request body size - format: "10m", "1g", "500k" (default: "10m")
         "max-body-size": "25m"
     },
     {
-        "domain": "api.example.com",
+        // ==========================================
+        // 2. Proxy with Header Controls
+        // ==========================================
+        "domain": "internal-api.example.com",
         "forwarding": "192.168.1.100:8080",
-        // Different type: allows both HTTP and HTTPS forwarding
         "type": "https",
-        // Rate limiting - simple number format applies to all paths
-        "rate-limit": 200,
-        // WebSocket disabled
-        "websocket": false,
-        // Compression disabled
-        "compression": false,
-        // Security headers disabled
-        "security-headers": false,
-        "max-body-size": "100m"
+        // Optional: Exclude X-Forwarded-For and X-Real-IP headers from forwarding
+        "no-x-forwarded-for": true
     },
     {
-        "domain": "legacy.example.com",
-        "forwarding": "old-server.internal",
-        // HTTP only - no SSL/HTTPS
-        "type": "http",
-        // No allowed-paths restriction - all paths forwarded
-        "allowed-paths": [],
-        // No rate limiting
-        "rate-limit": {},
-        "max-body-size": "1g"
+        // ==========================================
+        // 3. Permanent / Temporary Redirects
+        // ==========================================
+        "domain": "redirect.example.com",
+        // The destination URL to redirect to
+        "forwarding": "https://google.com/search",
+        // "redirect-perm" (301) or "redirect-temp" (302)
+        "type": "redirect-perm",
+        "ca-bundle": "fullchain.pem",
+        "private-key": "privkey.pem",
+        // Optional: Append URL path to forwarding address (e.g. domain/hello -> google.com/search/hello)
+        "forward-url-path": true,
+        "rate-limit": {
+            "/": 60
+        }
     },
     {
-        "domain": "jellyfin.example.org",
-        "forwarding": "127.0.0.1:8096",
-        "type": "https-only",
-        "service": "jellyfin"
+        // ==========================================
+        // 4. Static File Server (HTTPS Only)
+        // ==========================================
+        "domain": "static.example.com",
+        "type": "static-https-only",
+        "ca-bundle": "fullchain.pem",
+        "private-key": "privkey.pem",
+        // Mappings of request routes to static files or directories under /public/
+        "path": {
+            "/hello": "hello.html",     // Exact match: serves /public/hello.html
+            "/hello/": "hello/",        // Directory match: serves directory contents
+            "/hello/*": "hello.html",   // 1-Level wildcard: serves hello.html for /hello/abc, returns 404 for deeper paths
+            "/assets/**": "assets/"     // Recursive wildcard: serves files under assets/ at any depth
+        },
+        "rate-limit": {
+            "/": 150
+        }
+    },
+    {
+        // ==========================================
+        // 5. Custom Error Page Handlers
+        // ==========================================
+        // Error handlers are mapped to their domains as separate service blocks
+        "domain": "app.example.com",
+        // Custom 404 handler that redirects the user permanently
+        "type": "404:redirect-perm",
+        "forwarding": "https://example.com/not-found"
+    },
+    {
+        "domain": "app.example.com",
+        // Custom 500 handler serving a static HTML file
+        "type": "500:static-https",
+        "ca-bundle": "fullchain.pem",
+        "private-key": "privkey.pem",
+        "path": {
+            "/": "errors/500.html"
+        }
+    },
+    {
+        "domain": "app.example.com",
+        // Wildcard fallback handler mapping all other error codes (403, 502, etc.) to a static page
+        "type": "*:static-http",
+        "path": {
+            "/": "errors/general.html"
+        }
     }
 ]
