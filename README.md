@@ -1,20 +1,19 @@
 # oneserver
 
-*Unified proxy configuration generator for Nginx and Ferron*
+*Unified proxy configuration generator for Nginx*
 
-`oneserver` is an automation framework that translates a single `settings.json` file into highly optimized configuration files for both **Nginx** (`nginx-proxy.conf`) and **Ferron** (`ferron.kdl`). It includes a built-in visual settings editor to manage reverse proxy rules easily.
+`oneserver` is an automation framework that translates a single `settings.json` file into highly optimized configuration files for **Nginx** (`nginx-proxy.conf`). It includes a built-in visual settings editor to manage reverse proxy rules easily.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://python.org)
 [![Docker](https://img.shields.io/badge/Docker-Supported-blue?style=flat-square&logo=docker)](https://docker.com)
 [![Nginx](https://img.shields.io/badge/Nginx-Compatible-green?style=flat-square&logo=nginx)](https://nginx.org)
-[![Ferron](https://img.shields.io/badge/Ferron-Supported-orange?style=flat-square)](https://github.com/lucaszhang/ferron)
 
 ---
 
 ## Features
 
 - 🎯 **Unified Configuration**: Maintain your routing rules, rate limits, timeouts, and SSL paths in a single JSON file.
-- ⚡ **Multi-Proxy Output**: Compile config files for either **Nginx** (`nginx-proxy.conf`) or **Ferron** (`ferron.kdl`) using the same source file.
+- ⚡ **Automated Generation**: Compile optimized Nginx config files (`nginx-proxy.conf`) using the source file.
 - 🛠️ **Visual Editor**: Build and manage proxy configurations in your web browser with a clean GUI interface.
 - 🔒 **Production Ready**: Generates modern security headers, Gzip compression, WebSocket support, rate limiting, and HTTP-to-HTTPS redirects automatically.
 - 🚀 **Advanced Routing**: Support for allowed path filters, request timeouts, request body size limits, caching controls, and proxy buffering toggles.
@@ -53,27 +52,20 @@ Create a `settings.json` file in the root directory (see [settings.json.example]
 
 ### 2. Generate Configurations
 
-Run the generator script for your proxy of choice:
+Run the generator script for Nginx:
 
-#### For Nginx
 ```bash
 python3 generate_nginx_config.py
 ```
 This generates an optimized [nginx-proxy.conf](file:///Users/lucaszhang/oneserver/nginx-proxy.conf).
 
-#### For Ferron
-```bash
-python3 generate_ferron_config.py
-```
-This generates a [ferron.kdl](file:///Users/lucaszhang/oneserver/ferron.kdl) config.
-
 ### 3. Command Line Options
-Both scripts support the following parameters:
+The script supports the following parameters:
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
 | `--input` | `-i` | Input settings JSON path | `settings.json` |
-| `--output` | `-o` | Output configuration path | `nginx-proxy.conf` / `ferron.kdl` |
+| `--output` | `-o` | Output Nginx config path | `nginx-proxy.conf` |
 | `--dry-run` | | Print the generated output to stdout without writing | |
 
 ---
@@ -97,6 +89,7 @@ The following fields can be configured for each domain:
 | `security-headers` | Boolean | `true` | Enables strict security headers (HSTS, X-Frame-Options, X-Content-Type-Options). |
 | `csp-unsafe-eval` | Boolean | `false` | Allows `unsafe-eval` in the Content Security Policy header. |
 | `csp-wildcard` | Boolean | `false` | Relaxes CSP constraints, allowing wildcards in source mappings. |
+| `no-x-forwarded-for` | Boolean | `false` | Excludes both `X-Forwarded-For` and `X-Real-IP` proxy headers from requests to this backend. |
 
 ### Performance & Limits
 | Field | Type | Default | Description |
@@ -112,7 +105,7 @@ The following fields can be configured for each domain:
 | `service` | String | `""` | Tag/identifier associated with the target backend service. |
 
 > [!NOTE]
-> Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`) are fully compatible and normalized automatically by the generator scripts.
+> Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`, `no_x_forwarded_for`) are fully compatible and normalized automatically by the generator scripts.
 
 ---
 
@@ -136,7 +129,7 @@ Rate limiting is separated per-domain to prevent resource starvation.
 
 ### Allowed Path Restriction
 
-If `allowed-paths` is specified, Nginx and Ferron will reject requests targeting unregistered paths:
+If `allowed-paths` is specified, Nginx will reject requests targeting unregistered paths:
 
 ```json
 "allowed-paths": ["/public", "/api/v1"]
