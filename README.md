@@ -1,315 +1,158 @@
-# Nginx Configuration Generator
+# oneserver
 
-Convert your `settings.json` to a complete `nginx-proxy.conf` file with either Python or JavaScript.
+*Unified proxy configuration generator for Nginx and Ferron*
 
-## 🚀 Quick Start
+`oneserver` is an automation framework that translates a single `settings.json` file into highly optimized configuration files for both **Nginx** (`nginx-proxy.conf`) and **Ferron** (`ferron.kdl`). It includes a built-in visual settings editor to manage reverse proxy rules easily.
 
-### Using Python
-```bash
-# Generate nginx-proxy.conf from settings.json
-python3 generate_nginx_config.py
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://python.org)
+[![Docker](https://img.shields.io/badge/Docker-Supported-blue?style=flat-square&logo=docker)](https://docker.com)
+[![Nginx](https://img.shields.io/badge/Nginx-Compatible-green?style=flat-square&logo=nginx)](https://nginx.org)
+[![Ferron](https://img.shields.io/badge/Ferron-Supported-orange?style=flat-square)](https://github.com/lucaszhang/ferron)
 
-# Custom input/output files
-python3 generate_nginx_config.py --input my-settings.json --output my-nginx.conf
+---
 
-# Preview without writing to file
-python3 generate_nginx_config.py --dry-run
-```
+## Features
 
-### Using Node.js/JavaScript
-```bash
-# Generate nginx-proxy.conf from settings.json
-node generate_nginx_config.js
+- 🎯 **Unified Configuration**: Maintain your routing rules, rate limits, timeouts, and SSL paths in a single JSON file.
+- ⚡ **Multi-Proxy Output**: Compile config files for either **Nginx** (`nginx-proxy.conf`) or **Ferron** (`ferron.kdl`) using the same source file.
+- 🛠️ **Visual Editor**: Build and manage proxy configurations in your web browser with a clean GUI interface.
+- 🔒 **Production Ready**: Generates modern security headers, Gzip compression, WebSocket support, rate limiting, and HTTP-to-HTTPS redirects automatically.
+- 🚀 **Advanced Routing**: Support for allowed path filters, request timeouts, request body size limits, caching controls, and proxy buffering toggles.
 
-# Custom input/output files
-node generate_nginx_config.js --input my-settings.json --output my-nginx.conf
+---
 
-# Preview without writing to file
-node generate_nginx_config.js --dry-run
-```
+## Visual Settings Editor
 
-## ⚙️ Settings.json Format
+`oneserver` includes a web-based visual editor located in [settings-editor/index.html](file:///Users/lucaszhang/oneserver/settings-editor/index.html).
+
+You can open this file in any modern web browser to:
+1. Load and view existing `settings.json` configurations.
+2. Interactively add, delete, or configure domain rules.
+3. Export the formatted JSON settings back into your project.
+
+---
+
+## Quick Start
+
+### 1. Configure Domains
+Create a `settings.json` file in the root directory (see [settings.json.example](file:///Users/lucaszhang/oneserver/settings.json.example) for inspiration). Comments using `//` are fully supported:
 
 ```json
 [
-    {
-        "domain": "example.com",
-        "forwarding": "127.0.0.1:3003",
-        "type": "https-only",
-        "ca-bundle": "cert/example.com/ca-bundle.txt",
-        "private-key": "cert/example.com/private-key.txt"
-    },
-    {
-        "domain": "api.example.com",
-        "forwarding": "192.168.1.100:8000",
-        "type": "https",
-        "rate-limit": {
-            "/": 100,
-            "/api": 10,
-            "/upload": 2
-        },
-        "websocket": false
-    },
-    {
-        "domain": "dev.example.com",
-        "forwarding": "host.docker.internal:50030",
-        "type": "https"
-    }
-]
-```
-
-## 📋 Configuration Options
-
-### Required Fields
-- **`domain`**: The domain name to serve (e.g., "example.com")
-- **`forwarding`**: Backend server address and port (e.g., "127.0.0.1:3000")
-
-### Optional Fields
-- **`type`**: Connection type - "http" (HTTP only), "https" (HTTPS + HTTP forwarding), or "https-only" (HTTPS with HTTP redirect) (default: `"https-only"`)
-- **`ca-bundle`**: Path to SSL certificate file (relative to `/etc/nginx/ssl/`)
-- **`private-key`**: Path to SSL private key file (relative to `/etc/nginx/ssl/`)
-- **`rate-limit`**: Rate limiting per minute - can be a number (applies to all paths) or object with path-specific limits (default: no limits)
-- **`websocket`**: Enable WebSocket support (default: `true`)
-- **`compression`**: Enable gzip compression (default: `true`)
-- **`security-headers`**: Enable security headers (default: `true`)
-
-## 🔒 SSL Certificate Handling
-
-### Option 1: Specify Custom Paths
-```json
-{
-    "domain": "example.com",
-    "forwarding": "127.0.0.1:3000",
+  {
+    "domain": "api.example.com",
+    "forwarding": "host.docker.internal:8000",
     "type": "https-only",
-    "ca-bundle": "example.com/fullchain.pem",
-    "private-key": "example.com/privkey.pem"
-}
-```
-
-### Option 2: Use Default Let's Encrypt Structure
-```json
-{
-    "domain": "example.com",
-    "forwarding": "127.0.0.1:3000",
-    "type": "https-only"
-}
-```
-This will use:
-- Certificate: `/etc/nginx/ssl/example.com/fullchain.pem`
-- Private Key: `/etc/nginx/ssl/example.com/privkey.pem`
-
-## 🔀 Connection Type Options
-
-### Option 1: HTTP Only (type: "http")
-```json
-{
-    "domain": "legacy.example.com",
-    "forwarding": "192.168.1.50:80",
-    "type": "http"
-}
-```
-- Only HTTP is available, no SSL certificates required
-- HTTP requests to `http://legacy.example.com/test` are forwarded to `http://192.168.1.50:80/test`
-- Useful for legacy systems or internal services
-
-### Option 2: HTTPS with HTTP Forwarding (type: "https")
-```json
-{
-    "domain": "dev.example.com",
-    "forwarding": "host.docker.internal:50030",
-    "type": "https"
-}
-```
-- HTTP requests to `http://dev.example.com/test` are forwarded to `http://host.docker.internal:50030/test`
-- HTTPS requests to `https://dev.example.com/test` are forwarded to `http://host.docker.internal:50030/test`
-- Useful for development environments or when backend doesn't support HTTPS
-
-### Option 3: HTTPS Only with HTTP Redirect (type: "https-only", default)
-```json
-{
-    "domain": "example.com",
-    "forwarding": "127.0.0.1:3000",
-    "type": "https-only"
-}
-```
-- HTTP requests to `http://example.com/test` are redirected to `https://example.com/test`
-- Only HTTPS requests reach the backend
-- Recommended for production environments
-
-## 🚦 Rate Limiting Configuration
-
-### Option 1: Simple Rate Limiting (Legacy)
-```json
-{
-    "domain": "api.example.com",
-    "forwarding": "127.0.0.1:8000",
-    "rate-limit": 100
-}
-```
-- Applies 100 requests/minute limit to all paths
-
-### Option 2: Path-Specific Rate Limiting
-```json
-{
-    "domain": "api.example.com",
-    "forwarding": "127.0.0.1:8000",
     "rate-limit": {
-        "/": 200,
-        "/api": 50,
-        "/api/upload": 5,
-        "/test/*/endpoint": 10
+      "/": 100,
+      "/upload": 5
     }
-}
-```
-- **`"/"`**: 200 requests/minute for root and unmatched paths
-- **`"/api"`**: 50 requests/minute for API endpoints
-- **`"/api/upload"`**: 5 requests/minute for upload endpoint (more specific, takes precedence)
-- **`"/test/*/endpoint"`**: 10 requests/minute for wildcard pattern (matches `/test/abc/endpoint`, `/test/123/endpoint`, etc.)
-
-### Rate Limiting Features
-✅ **Path specificity**: More specific paths take precedence over general ones
-✅ **Wildcard support**: Use `*` for pattern matching
-✅ **Burst handling**: Includes burst=5 nodelay for smooth traffic handling
-✅ **Per-domain zones**: Each domain gets separate rate limiting zones
-✅ **Backward compatibility**: Number format still works as before
-
-## 🎯 Generated Features
-
-The scripts automatically generate:
-
-✅ **HTTP to HTTPS redirects**
-✅ **SSL/TLS configuration** with modern cipher suites
-✅ **Security headers** (XSS, CSRF, etc.)
-✅ **Rate limiting** for API endpoints
-✅ **WebSocket support** for real-time apps
-✅ **Gzip compression** for better performance
-✅ **Proper proxy headers** for backend services
-✅ **Connection timeouts** and keep-alive settings
-
-## 📁 Example Settings for Multiple Domains
-
-```json
-[
-    {
-        "domain": "website.com",
-        "forwarding": "127.0.0.1:3000",
-        "type": "https-only"
-    },
-    {
-        "domain": "api.website.com",
-        "forwarding": "127.0.0.1:8000",
-        "type": "https-only",
-        "rate-limit": {
-            "/": 300,
-            "/api/v1": 100,
-            "/api/v1/upload": 10
-        },
-        "websocket": false
-    },
-    {
-        "domain": "admin.website.com",
-        "forwarding": "127.0.0.1:9000",
-        "type": "https-only",
-        "rate-limit": 50,
-        "security-headers": true
-    },
-    {
-        "domain": "legacy.website.com",
-        "forwarding": "192.168.1.50:80",
-        "type": "http",
-        "compression": false
-    },
-    {
-        "domain": "dev.website.com",
-        "forwarding": "host.docker.internal:3001",
-        "type": "https",
-        "security-headers": false
-    }
+  }
 ]
 ```
 
-## 🔧 Command Line Options
+### 2. Generate Configurations
 
-| Option | Description |
-|--------|-------------|
-| `--input`, `-i` | Input settings JSON file (default: `settings.json`) |
-| `--output`, `-o` | Output nginx config file (default: `nginx-proxy.conf`) |
-| `--dry-run` | Print config to stdout instead of writing to file |
-| `--help`, `-h` | Show help message |
+Run the generator script for your proxy of choice:
 
-## 🚀 Integration with Docker
+#### For Nginx
+```bash
+python3 generate_nginx_config.py
+```
+This generates an optimized [nginx-proxy.conf](file:///Users/lucaszhang/oneserver/nginx-proxy.conf).
 
-After generating your config:
+#### For Ferron
+```bash
+python3 generate_ferron_config.py
+```
+This generates a [ferron.kdl](file:///Users/lucaszhang/oneserver/ferron.kdl) config.
 
-1. **Update your nginx-proxy.conf**:
+### 3. Command Line Options
+Both scripts support the following parameters:
+
+| Flag | Short | Description | Default |
+|------|-------|-------------|---------|
+| `--input` | `-i` | Input settings JSON path | `settings.json` |
+| `--output` | `-o` | Output configuration path | `nginx-proxy.conf` / `ferron.kdl` |
+| `--dry-run` | | Print the generated output to stdout without writing | |
+
+---
+
+## Settings Specification (`settings.json`)
+
+The following fields can be configured for each domain:
+
+### Core Fields
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `domain` | String | Yes | - | The domain name (e.g. `api.example.com`). |
+| `forwarding` | String | Yes | - | Backend target address (e.g. `127.0.0.1:8080`, `host.docker.internal:3000`). |
+| `type` | String | No | `"https-only"` | Protocol type: `"http"`, `"https"`, or `"https-only"` (HTTPS with HTTP redirect). |
+
+### SSL / Security Fields
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ca-bundle` | String | *Auto-inferred* | Relative path to SSL certificate file (e.g., `fullchain.pem`). |
+| `private-key` | String | *Auto-inferred* | Relative path to SSL private key file (e.g., `privkey.pem`). |
+| `security-headers` | Boolean | `true` | Enables strict security headers (HSTS, X-Frame-Options, X-Content-Type-Options). |
+| `csp-unsafe-eval` | Boolean | `false` | Allows `unsafe-eval` in the Content Security Policy header. |
+| `csp-wildcard` | Boolean | `false` | Relaxes CSP constraints, allowing wildcards in source mappings. |
+
+### Performance & Limits
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `rate-limit` | Num / Dict | - | Rate limit per minute. Pass a number for global limit, or a path-to-limit dictionary. |
+| `websocket` | Boolean | `true` | Configures upstream connection upgrade headers for WebSocket support. |
+| `compression` | Boolean | `true` | Enables Gzip compression for static files and API payloads. |
+| `timeout` | String | `"120s"` | Connection timeout limit (e.g., `"60s"`, `"10m"`). |
+| `max-body-size` | String | `"10m"` | Maximum allowed request client body size (e.g., `"50g"`, `"500m"`). |
+| `allowed-paths` | Array | `[]` | Limit access to specific URL paths. Requests to other paths return a 403 Forbidden. |
+| `proxy-buffering-off` | Boolean | `false` | Disables proxy buffering, turning on real-time streaming for SSE/events. |
+| `proxy-cache-off` | Boolean | `false` | Configures headers and proxy directives to bypass caching. |
+| `service` | String | `""` | Tag/identifier associated with the target backend service. |
+
+> [!NOTE]
+> Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`) are fully compatible and normalized automatically by the generator scripts.
+
+---
+
+## Advanced Configurations
+
+### Rate Limiting
+
+Rate limiting is separated per-domain to prevent resource starvation.
+
+```json
+"rate-limit": {
+  "/": 200,
+  "/api": 50,
+  "/api/upload": 5,
+  "/test/*/endpoint": 10
+}
+```
+- **Path Precedence**: Specific endpoints take priority over general paths.
+- **Wildcard Support**: Use `*` to match dynamic path segments.
+- **Burst Handling**: A burst parameter with `nodelay` is automatically added to prevent false-positives on bursty browser traffic.
+
+### Allowed Path Restriction
+
+If `allowed-paths` is specified, Nginx and Ferron will reject requests targeting unregistered paths:
+
+```json
+"allowed-paths": ["/public", "/api/v1"]
+```
+
+---
+
+## Docker Integration
+
+To deploy the generated Nginx configuration:
+
+1. **Compile config file**:
    ```bash
    python3 generate_nginx_config.py
    ```
-
-2. **Restart nginx container**:
+2. **Reload / Restart Nginx**:
    ```bash
-   docker-compose restart proxy-nginx
+   docker compose exec oneserver nginx -t && docker compose restart oneserver
    ```
-
-3. **Check nginx syntax**:
-   ```bash
-   docker-compose exec proxy-nginx nginx -t
-   ```
-
-## 🛠️ Advanced Usage
-
-### Environment-Specific Configs
-```bash
-# Development
-python3 generate_nginx_config.py --input settings-dev.json --output nginx-dev.conf
-
-# Production
-python3 generate_nginx_config.py --input settings-prod.json --output nginx-prod.conf
-
-# Staging
-python3 generate_nginx_config.py --input settings-staging.json --output nginx-staging.conf
-```
-
-### Automated Deployment
-```bash
-#!/bin/bash
-# deploy.sh
-python3 generate_nginx_config.py --input production-settings.json
-docker-compose exec proxy-nginx nginx -t && docker-compose restart proxy-nginx
-```
-
-## 📝 Notes
-
-- The scripts validate your settings.json before generating the config
-- SSL certificates must be placed in the correct directory structure
-- Rate limiting is applied to `/api/` endpoints by default
-- WebSocket connections are supported automatically
-- All generated configs include modern security best practices
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **"Settings file not found"**
-   - Ensure `settings.json` exists in the current directory
-   - Use `--input` to specify a different file
-
-2. **"Invalid JSON"**
-   - Validate your JSON syntax using an online JSON validator
-   - Check for trailing commas or missing quotes
-
-3. **"Missing required field"**
-   - Ensure each domain has both `domain` and `forwarding` fields
-   - Check spelling and format of required fields
-
-### Debug Your Config
-```bash
-# Test generated config syntax
-docker-compose exec proxy-nginx nginx -t
-
-# View generated upstream servers
-grep -A5 "upstream" nginx-proxy.conf
-
-# Check SSL certificate paths
-grep "ssl_certificate" nginx-proxy.conf
-```
