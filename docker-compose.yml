@@ -5,15 +5,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: oneserver
-    ports:
-      - "80:80"
-      - "443:443"
+    network_mode: "host"
     volumes:
       - ${ONESERVER_PWD:-.}/cert:/etc/nginx/ssl:ro
       - ${ONESERVER_PWD:-.}/nginx-logs:/var/log/nginx
+      - ${ONESERVER_PWD:-.}/public:/public:ro
     restart: unless-stopped
-    networks:
-      - oneserver_bridge
 
 networks:
   oneserver_bridge:
