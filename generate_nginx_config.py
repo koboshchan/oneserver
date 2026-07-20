@@ -15,6 +15,28 @@ from collections import Counter
 from typing import List, Dict, Any, Set
 
 
+# Settings that a `service` template silently ignores (the template only substitutes a
+# fixed set of {{placeholder}} tokens - domain, upstream_name, ssl_cert, ssl_key,
+# max_body_size, host, port, error_pages, error_locations). Listed as (display name,
+# accepted key spellings) so validate_setting() can warn when one is set alongside 'service'.
+IGNORED_WHEN_SERVICE = [
+    ("timeout", ["timeout"]),
+    ("proxy-buffering-off", ["proxy-buffering-off", "proxy_buffering_off"]),
+    ("proxy-cache-off", ["proxy-cache-off", "proxy_cache_off"]),
+    ("compression", ["compression"]),
+    ("csp-unsafe-eval", ["csp-unsafe-eval", "csp_unsafe_eval"]),
+    ("csp-wildcard", ["csp-wildcard", "csp_wildcard"]),
+    ("security-headers", ["security-headers", "security_headers"]),
+    ("websocket", ["websocket"]),
+    ("no-x-forwarded-for", ["no-x-forwarded-for", "no_x_forwarded_for"]),
+    ("no-x-forwarded-host", ["no-x-forwarded-host", "no_x_forwarded_host"]),
+    ("rate-limit", ["rate-limit", "rate_limit"]),
+    ("allowed-paths", ["allowed-paths", "allowed_paths"]),
+    ("forward-url-path", ["forward-url-path", "forward_url_path"]),
+    ("path", ["path"]),
+]
+
+
 def is_wsl() -> bool:
     """Detect if running inside Windows Subsystem for Linux (WSL)."""
     try:
@@ -125,6 +147,13 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     is_static = connection_type in ["static-http", "static-https", "static-https-only"]
     is_redirect = connection_type in ["redirect-temp", "redirect-perm"]
 
+    service_name_raw = setting.get("service", "").strip()
+    if service_name_raw and connection_type not in ["http", "https", "https-only"]:
+        raise ValueError(
+            f"'service' template '{service_name_raw}' can only be combined with type "
+            f"'http', 'https', or 'https-only' (got '{connection_type}') for domain '{domain}'"
+        )
+
     if not is_static:
         if "forwarding" not in setting or not setting["forwarding"]:
             raise ValueError(f"Missing required field 'forwarding' for type '{connection_type}' in domain '{domain}'")
@@ -234,6 +263,16 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Could not parse forwarding target address: {validated['forwarding']}")
         
         validated["upstream_name"] = validated["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_") + "_backend"
+
+    if validated["service"] and (Path("services") / f"{validated['service']}.conf").exists():
+        ignored_present = [display for display, keys in IGNORED_WHEN_SERVICE if any(k in setting for k in keys)]
+        if ignored_present:
+            print(
+                f"Warning: domain '{domain}' uses service template '{validated['service']}', "
+                f"which ignores: {', '.join(ignored_present)}. Edit services/{validated['service']}.conf "
+                "directly to change this behavior.",
+                file=sys.stderr
+            )
 
     return validated
 
@@ -711,13 +750,19 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
                 host_val = main_entry.get("host", "127.0.0.1")
                 port_val = str(main_entry.get("port", 80))
 
+                error_directives = generate_error_page_directives(handlers, indent="    ")
+                error_locations = generate_error_handlers_locations(handlers, indent="    ")
+                error_locations_str = f"\n\n{error_locations}" if error_locations else ""
+
                 block = template.replace("{{domain}}", dom) \
                                 .replace("{{upstream_name}}", main_entry.get("upstream_name", "")) \
                                 .replace("{{ssl_cert}}", ssl_cert) \
                                 .replace("{{ssl_key}}", ssl_key) \
                                 .replace("{{max_body_size}}", main_entry["max_body_size"]) \
                                 .replace("{{host}}", host_val) \
-                                .replace("{{port}}", port_val)
+                                .replace("{{port}}", port_val) \
+                                .replace("{{error_pages}}", error_directives) \
+                                .replace("{{error_locations}}", error_locations_str)
                 service_blocks.append(f"    # Custom Service: {main_entry['service']}\n{block}")
         else:
             secure_types = ["https", "https-only", "redirect-temp", "redirect-perm", "static-https", "static-https-only"]
