@@ -206,8 +206,11 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         # Warning if target points to root directory /
         if v_clean in ["/", "", "./"]:
             print(f"Warning: Path mapping target '{v_clean}' for route '{k_clean}' in domain '{domain}' points to the root directory.", file=sys.stderr)
-        # Error if source path does not end with / but target path ends with /
-        if not k_clean.endswith("/") and v_clean.endswith("/"):
+        # Error if source path does not end with / but target path ends with /.
+        # Wildcard keys ('/x/*' or '/x/**') are exempt: they route sub-paths beneath
+        # the key's base, so a directory target is expected and valid there.
+        is_wildcard_key = k_clean.endswith("/*") or k_clean.endswith("/**")
+        if not k_clean.endswith("/") and not is_wildcard_key and v_clean.endswith("/"):
             raise ValueError(f"Invalid path mapping '{k_clean}': '{v_clean}' in domain '{domain}'. Check if the target path is a directory (ends with '/') when the source path does not end with '/'.")
         normalized_paths_dict[k_clean] = v_clean
 
@@ -240,6 +243,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "allowed_paths": normalized_paths,
         "proxy_buffering_off": setting.get("proxy-buffering-off", setting.get("proxy_buffering_off", False)) or False,
         "proxy_cache_off": setting.get("proxy-cache-off", setting.get("proxy_cache_off", False)) or False,
+        "proxy_intercept_errors": setting.get("proxy-intercept-errors", setting.get("proxy_intercept_errors", False)),
         "service": setting.get("service", "").strip(),
         "forward_url_path": setting.get("forward-url-path", setting.get("forward_url_path", False)),
         "path": normalized_paths_dict,
@@ -304,18 +308,20 @@ def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str 
     if rate_zone:
         lines.insert(0, f"{indent}limit_req zone={rate_zone} burst=5 nodelay;")
 
+    lines.append(f"{indent}proxy_http_version 1.1;")
     if setting["websocket"]:
         lines.extend([
-            f"{indent}proxy_http_version 1.1;",
             f"{indent}proxy_set_header Upgrade $http_upgrade;",
             f"{indent}proxy_set_header Connection \"upgrade\";"
         ])
+    else:
+        lines.append(f"{indent}proxy_set_header Connection \"\";")
 
     if setting["proxy_buffering_off"]:
         lines.append(f"{indent}proxy_buffering off;")
     if setting["proxy_cache_off"]:
         lines.append(f"{indent}proxy_cache off;")
-    if has_handlers:
+    if setting.get("proxy_intercept_errors", False):
         lines.append(f"{indent}proxy_intercept_errors on;")
 
     lines.extend([
@@ -422,7 +428,11 @@ def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: st
 
         if k.endswith("/**"):
             clean_k = k[:-3]
-            regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
+            if v.strip().endswith("/"):
+                alias_base = target_path.rstrip("/")
+                regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{{rate_limit_line}\n{indent}    alias {alias_base}$1;\n{indent}}}")
+            else:
+                regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
         elif k.endswith("/*"):
             clean_k = k[:-2]
             # Match one level deep
@@ -500,7 +510,7 @@ def generate_error_page_directives(handlers: List[Dict[str, Any]], indent: str =
         if h["error_code"] != "*":
             directives.append(f"{indent}error_page {h['error_code']} = @error_{h['error_code']};")
         else:
-            common_codes = [400, 401, 402, 403, 404, 405, 408, 429, 500, 502, 503, 504]
+            common_codes = [400, 401, 402, 403, 404, 408, 429, 500, 502, 503, 504]
             explicit_codes = {x["error_code"] for x in handlers if x["error_code"] != "*"}
             wildcard_codes = [c for c in common_codes if c not in explicit_codes]
             directives.append(f"{indent}error_page {' '.join(map(str, wildcard_codes))} = @error_wildcard;")
@@ -531,6 +541,7 @@ def generate_error_handlers_locations(handlers: List[Dict[str, Any]], indent: st
                 file_target = f"{lbl}.html" if lbl != "wildcard" else "error.html"
             
             loc_lines.append(f"{indent}    root /public;")
+            loc_lines.append(f"{indent}    error_page 405 =200 $uri;")
             loc_lines.append(f"{indent}    rewrite ^ /{file_target} break;")
         
         blocks.append(f"{indent}location @error_{lbl} {{\n" + "\n".join(loc_lines) + f"\n{indent}}}")
@@ -783,7 +794,7 @@ http {{
 
     log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                     '$status $body_bytes_sent "$http_referer" '
-                    '"$http_user_agent" "$http_x_forwarded_for"';
+                    '"$http_user_agent" "$http_x_forwarded_for" host="$host"';
 
     access_log /var/log/nginx/access.log main;
     error_log /var/log/nginx/error.log;
