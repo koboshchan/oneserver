@@ -100,6 +100,7 @@ Each domain configuration object in the settings array supports the following fi
 | `path` | Dict | `{}` | Route-to-file mappings (required for static serving types). |
 | `forward-url-path` | Boolean | `false` | If `true`, the requested URL path is appended to the forwarding target on redirects. |
 | `service` | String | `""` | Tag/identifier associated with the target backend service. |
+| `anubis` | Boolean / Dict | `{}` | Routes matching paths through the [Anubis](https://github.com/TecharoHQ/anubis) bot-protection challenge. See [Bot Protection](#bot-protection-anubis) below. |
 
 > [!NOTE]
 > Snake_case variant keys (e.g. `rate_limit`, `ca_bundle`, `private_key`, `security_headers`, `csp_unsafe_eval`, `csp_wildcard`, `max_body_size`, `allowed_paths`, `proxy_buffering_off`, `proxy_cache_off`, `no_x_forwarded_for`, `no_x_forwarded_host`, `forward_url_path`) are fully compatible and normalized automatically.
@@ -148,6 +149,50 @@ Static serving handles route-to-file mappings relative to the `/public` director
 
 > [!ERROR]
 > The path generator validates mappings at compile time. Source paths without a trailing slash (e.g., `/hello`) mapping to directory targets (e.g., `hello/`) will throw an error, as will defining conflicting wildcards (`/*` and `/**`) on the same base path.
+
+---
+
+## Bot Protection (Anubis)
+
+Any `http`, `https`, `https-only`, or `static-*` domain can route selected paths through [Anubis](https://github.com/TecharoHQ/anubis), which challenges suspected bots with a proof-of-work check before letting them through. It is off by default and configured per path via the `anubis` key:
+
+```json
+{
+    "domain": "app.example.com",
+    "forwarding": "localhost:3000",
+    "type": "https-only",
+    "anubis": {
+        "/*": true,              // One path segment from root (e.g. /foo, not /foo/bar)
+        "/**": true,              // Everything, recursively
+        "/hello/*": true,        // One segment under /hello
+        "/hello/api/**": false   // Carve-out: no challenge anywhere under /hello/api
+    }
+}
+```
+
+`"anubis": true` is shorthand for `{"/**": true}` (challenge the whole domain).
+
+**Precedence** (highest to lowest): exact paths → `/*` single-segment wildcards → `/**` recursive wildcards. This is a strict class ordering - a `/*` rule always outranks a `/**` rule on overlapping paths, regardless of which base path is longer. Within the same class, the longer base path wins. A path with no matching rule is never challenged.
+
+Not supported on `redirect-temp`/`redirect-perm` types, or on domains using a `service` template (`services/*.conf`) - those are ignored with a warning, same as `rate-limit` and other template-incompatible keys.
+
+### How it works
+
+Anubis has one global upstream target, so per-domain routing uses an internal loopback: nginx's public `:443`/`:80` blocks send anubis-enabled paths to the `anubis` container, which - once a client passes its challenge - hands the request back to nginx on an internal `:8081` port, dispatched by domain (`server_name`). That internal block proxies to the domain's real backend (or serves the real static files) exactly as the public block would with `anubis` disabled:
+
+```
+client → nginx :443 ── anubis-enabled path ──→ anubis:8080 ──→ nginx :8081 (internal) → real upstream
+                └──────────── no match ──────────────────────────────────────────────↗
+```
+
+Port `8081` is not published in `docker-compose.yml` - it's reachable only from other containers on `oneserver_bridge`.
+
+### Caveats
+
+- **Rebuild, not restart.** `nginx.conf` is generated at Docker **build** time (see [Docker & Bridge Networking](#docker--bridge-networking)), so enabling or changing `anubis` rules requires `docker compose build oneserver`, not just a restart.
+- **WebSockets.** Anubis dispatch keys on the request path only, so a WebSocket endpoint under an enabled rule will get challenged and fail to upgrade. Add an explicit carve-out, e.g. `"/ws/**": false`.
+- **Bridge-internal bypass.** Any container on `oneserver_bridge` can reach `oneserver:8081` directly and skip the challenge - this is only a boundary against external clients.
+- **Bot policy.** Anubis's own allow/deny/challenge rules live in `botPolicy.yaml` at the repo root (mounted read-only into the `anubis` container). A minimal default ships with the repo; see [Anubis's policy docs](https://anubis.techaro.lol/docs/admin/policies/) to tune it.
 
 ---
 
@@ -210,12 +255,15 @@ services:
       - ${ONESERVER_PWD:-.}/nginx-logs:/var/log/nginx
       - ${ONESERVER_PWD:-.}/public:/public:ro
     restart: unless-stopped
+    depends_on:
+      anubis:
+        condition: service_healthy
     networks:
       - oneserver_bridge
 ```
 
 > [!NOTE]
-> Other services (like your API backend or app containers) should join the external `oneserver_bridge` network. This enables Nginx to forward requests directly using their container name and port (e.g. `"forwarding": "api:8080"`).
+> Other services (like your API backend or app containers) join the external `oneserver_bridge` network so Nginx can forward requests directly using their container name and port (e.g. `"forwarding": "api:8080"`).
 
 ---
 

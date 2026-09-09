@@ -1,0 +1,28 @@
+## botPolicy.yaml - default Anubis bot policy for oneserver.
+##
+## This is a minimal starting point, not a comprehensive ruleset: allow a short list of
+## well-behaved crawlers outright, deny a short list of known-bad clients outright, and
+## challenge everything else that looks like a browser. Tune this file to your traffic;
+## see https://anubis.techaro.lol/docs/admin/policies/ for the full policy syntax.
+
+bots:
+  # Well-known search engine crawlers - let them through unchallenged.
+  - name: googlebot
+    user_agent_regex: (?i)googlebot
+    action: ALLOW
+
+  - name: bingbot
+    user_agent_regex: (?i)bingbot
+    action: ALLOW
+
+  # Known-bad / aggressive scraping clients - reject outright.
+  - name: bad-crawlers
+    user_agent_regex: (?i)(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot)
+    action: DENY
+
+  # Anything presenting as a browser gets a proof-of-work challenge.
+  - name: generic-browser
+    user_agent_regex: (?i)Mozilla
+    action: CHALLENGE
+
+dnsbl: false

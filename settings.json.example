@@ -91,5 +91,20 @@
         "path": {
             "/": "errors/general.html"
         }
+    },
+    {
+        // ==========================================
+        // 6. Bot Protection with Anubis
+        // ==========================================
+        "domain": "protected.example.com",
+        "forwarding": "localhost:5000",
+        "type": "https-only",
+        "ca-bundle": "fullchain.pem",
+        "private-key": "privkey.pem",
+        // Challenge the whole domain, but carve out the API from the challenge
+        "anubis": {
+            "/**": true,
+            "/api/**": false
+        }
     }
 ]

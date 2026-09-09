@@ -34,6 +34,7 @@ IGNORED_WHEN_SERVICE = [
     ("allowed-paths", ["allowed-paths", "allowed_paths"]),
     ("forward-url-path", ["forward-url-path", "forward_url_path"]),
     ("path", ["path"]),
+    ("anubis", ["anubis"]),
 ]
 
 
@@ -106,6 +107,72 @@ def load_settings(file_path: str) -> List[Dict[str, Any]]:
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON in '{file_path}': {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def _normalize_anubis(raw: Any, domain: str, connection_type: str, error_code: Any) -> Dict[str, bool]:
+    """Validate and normalize the 'anubis' key into a dict of path glob -> bool."""
+    if raw is None or raw is False:
+        return {}
+    if raw is True:
+        raw = {"/**": True}
+    if not isinstance(raw, dict):
+        raise ValueError(f"'anubis' must be a boolean or a dict of path globs to booleans in domain '{domain}'")
+
+    normalized: Dict[str, bool] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            raise ValueError(f"All keys in 'anubis' must be strings in domain '{domain}'")
+        if not isinstance(v, bool):
+            raise ValueError(f"All values in 'anubis' must be booleans in domain '{domain}' (got value for '{k}')")
+
+        k_clean = k.strip()
+        if not k_clean.startswith("/"):
+            raise ValueError(f"Invalid anubis path glob '{k}' in domain '{domain}': paths must start with '/'")
+
+        # Strip a trailing glob suffix, then the remaining base must contain no '*'
+        if k_clean.endswith("/**"):
+            base = k_clean[:-3]
+        elif k_clean.endswith("/*"):
+            base = k_clean[:-2]
+        else:
+            base = k_clean
+
+        if "*" in base:
+            raise ValueError(
+                f"Invalid anubis path glob '{k}' in domain '{domain}': "
+                "'*' is only allowed as a trailing '/*' or '/**'"
+            )
+
+        if base == "" and k_clean not in ("/*", "/**"):
+            raise ValueError(f"Invalid anubis path glob '{k}' in domain '{domain}'")
+
+        if k_clean == "/":
+            raise ValueError(f"Invalid anubis path glob '/' in domain '{domain}': use '/**' instead")
+
+        if k_clean.endswith("/") and k_clean not in ("/**",) and not k_clean.endswith("/*") and not k_clean.endswith("/**"):
+            raise ValueError(
+                f"Invalid anubis path glob '{k}' in domain '{domain}': "
+                "trailing '/' is not supported, use '/**' for recursive matches"
+            )
+
+        if base.startswith("/.within.website") or k_clean.startswith("/.within.website"):
+            raise ValueError(
+                f"Invalid anubis path glob '{k}' in domain '{domain}': "
+                "'/.within.website' is reserved for the Anubis challenge assets"
+            )
+
+        if k_clean in normalized:
+            raise ValueError(f"Duplicate anubis path glob '{k}' in domain '{domain}'")
+
+        normalized[k_clean] = v
+
+    if normalized:
+        if connection_type in ("redirect-temp", "redirect-perm"):
+            raise ValueError(f"'anubis' is not supported for type '{connection_type}' in domain '{domain}'")
+        if error_code is not None:
+            raise ValueError(f"'anubis' is not supported on error handler entries in domain '{domain}'")
+
+    return normalized
 
 
 def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
@@ -225,6 +292,8 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
             if base + "/**" in normalized_paths_dict:
                 raise ValueError(f"Conflicting path mappings: '{k}' and '{base}/**' cannot be used together in domain '{domain}'")
 
+    normalized_anubis = _normalize_anubis(setting.get("anubis"), domain, connection_type, error_code)
+
     validated = {
         "domain": domain,
         "forwarding": setting.get("forwarding", "").strip() if not is_static else "",
@@ -233,6 +302,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "ca_bundle": ca_bundle,
         "private_key": private_key,
         "rate_limit": rate_limit,
+        "anubis": normalized_anubis,
         "websocket": setting.get("websocket", True),
         "compression": setting.get("compression", True),
         "security_headers": setting.get("security-headers", setting.get("security_headers", True)),
@@ -277,33 +347,155 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
                 "directly to change this behavior.",
                 file=sys.stderr
             )
+        # Service templates render their own fixed location blocks - anubis routing has no
+        # hook into them, so it must not silently leak into global anubis emission.
+        validated["anubis"] = {}
 
     return validated
 
 
-def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str = "", has_handlers: bool = False) -> str:
+_ANUBIS_WITHIN_WEBSITE_RULE = ("regex", r"/\.within\.website(/.*)?", True)
+
+
+def _re_escape_path(p: str) -> str:
+    """Escape regex metacharacters in a literal URL path segment, leaving '/' intact."""
+    import re as _re
+    return _re.escape(p)
+
+
+def compile_anubis_rules(anubis: Dict[str, bool]) -> List[Any]:
+    """Normalize an 'anubis' dict into an ordered list of (kind, body, enabled) tuples,
+    highest precedence first. kind is "exact" (a literal path) or "regex" (an unanchored
+    regex body, to be anchored by the consumer as needed)."""
+    if not anubis:
+        return []
+
+    exact_bases: Set[str] = set()
+    single_rules = []  # (base, enabled) for /*-class
+    recursive_rules = []  # (base, enabled) for /**-class
+    exact_rules = []  # (path, enabled)
+
+    for k, v in anubis.items():
+        if k.endswith("/**"):
+            recursive_rules.append((k[:-3], v))
+        elif k.endswith("/*"):
+            single_rules.append((k[:-2], v))
+        else:
+            exact_rules.append((k, v))
+            exact_bases.add(k)
+
+    rules: List[Any] = []
+
+    if any(v for _, v in exact_rules) or any(v for _, v in single_rules) or any(v for _, v in recursive_rules):
+        rules.append(_ANUBIS_WITHIN_WEBSITE_RULE)
+
+    # Bucket 1: exact paths, longest first
+    for base, v in sorted(exact_rules, key=lambda x: (-len(x[0]), x[0])):
+        rules.append(("exact", base, v))
+
+    # Bucket 2: single-segment wildcards, longest base first
+    for base, v in sorted(single_rules, key=lambda x: (-len(x[0]), x[0])):
+        rules.append(("regex", f"{_re_escape_path(base)}/[^/]+", v))
+        if base != "" and base not in exact_bases:
+            rules.append(("regex", _re_escape_path(base), v))
+
+    # Bucket 3: recursive wildcards, longest base first
+    for base, v in sorted(recursive_rules, key=lambda x: (-len(x[0]), x[0])):
+        rules.append(("regex", f"{_re_escape_path(base)}(/.*)?", v))
+
+    return rules
+
+
+def anubis_map_entries(rules: List[Any], upstream_name: str) -> List[Any]:
+    """Compile ordered anubis rules into a list of (map_key, target_upstream) tuples for an
+    nginx `map $uri ...` block. map_key is a bare literal for exact rules, or `~^{body}$` for
+    regex rules. Exact keys are deduped (map does not allow duplicate literal keys)."""
+    entries = []
+    seen_exact: Set[str] = set()
+    for kind, body, enabled in rules:
+        target = "anubis_backend" if enabled else upstream_name
+        if kind == "exact":
+            if body in seen_exact:
+                continue
+            seen_exact.add(body)
+            entries.append((body, target))
+        else:
+            entries.append((f"~^{body}$", target))
+    return entries
+
+
+def anubis_location_specs(rules: List[Any]) -> List[str]:
+    """Return nginx location match specs (e.g. '= /hello' or '~ ^(?!...)(...)$') for each
+    enabled anubis rule, in precedence order, with negative lookaheads subtracting any
+    strictly higher-precedence disabled rule."""
+    specs = []
+    seen_higher_disabled: List[str] = []
+    for kind, body, enabled in rules:
+        if enabled:
+            if seen_higher_disabled:
+                lookaheads = "".join(f"(?!{b}$)" for b in seen_higher_disabled)
+                regex_body = _re_escape_path(body) if kind == "exact" else body
+                specs.append(f"~ ^{lookaheads}{regex_body}$")
+            elif kind == "exact":
+                specs.append(f"= {body}")
+            else:
+                specs.append(f"~ ^{body}$")
+        else:
+            seen_higher_disabled.append(body)
+    return specs
+
+
+def anubis_decision(rules: List[Any], uri: str) -> bool:
+    """Pure-Python precedence evaluator: does `uri` get routed through anubis under `rules`?"""
+    import re as _re
+    for kind, body, enabled in rules:
+        if kind == "exact":
+            if uri == body:
+                return enabled
+        else:
+            if _re.match(f"^{body}$", uri):
+                return enabled
+    return False
+
+
+def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str = "", has_handlers: bool = False,
+                            upstream_override: str = "", internal: bool = False) -> str:
     """Consolidate generation logic to avoid code repetition across routes."""
+    # upstream_override names either a declared `upstream {}` group (e.g. "anubis_backend")
+    # or an nginx map variable holding one (e.g. "$anubis_up_app_example_com"); both are
+    # valid proxy_pass targets once prefixed with a scheme.
+    target = f"http://{upstream_override}" if upstream_override else f"http://{setting['upstream_name']}"
+
     lines = [
-        f"{indent}proxy_pass http://{setting['upstream_name']};",
+        f"{indent}proxy_pass {target};",
         f"{indent}proxy_set_header Host $host;"
     ]
 
-    if not setting.get("no_x_forwarded_for", False):
+    # The anubis hop must always see the real client IP, even when the domain sets
+    # no_x_forwarded_for for its normal (non-anubis) backend traffic - otherwise every
+    # visitor looks identical to Anubis. Only the internal loopback honors the flag.
+    force_xff = setting.get("_anubis_force_xff", False)
+    if force_xff or not setting.get("no_x_forwarded_for", False):
         lines.extend([
             f"{indent}proxy_set_header X-Real-IP $remote_addr;",
             f"{indent}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
         ])
 
-    lines.extend([
-        f"{indent}proxy_set_header X-Forwarded-Proto $scheme;"
-    ])
+    if internal:
+        lines.append(f"{indent}proxy_set_header X-Forwarded-Proto $anubis_fwd_proto;")
+    else:
+        lines.append(f"{indent}proxy_set_header X-Forwarded-Proto $scheme;")
 
     if not setting.get("no_x_forwarded_host", False):
-        lines.append(f"{indent}proxy_set_header X-Forwarded-Host $host;")
+        if internal:
+            lines.append(f"{indent}proxy_set_header X-Forwarded-Host $anubis_fwd_host;")
+        else:
+            lines.append(f"{indent}proxy_set_header X-Forwarded-Host $host;")
 
-    lines.extend([
-        f"{indent}proxy_set_header X-Forwarded-Port $server_port;"
-    ])
+    if internal:
+        lines.append(f"{indent}proxy_set_header X-Forwarded-Port $anubis_fwd_port;")
+    else:
+        lines.append(f"{indent}proxy_set_header X-Forwarded-Port $server_port;")
 
     if rate_zone:
         lines.insert(0, f"{indent}limit_req zone={rate_zone} burst=5 nodelay;")
@@ -352,6 +544,11 @@ def generate_security_headers(setting: Dict[str, Any], indent: str = "        ",
         csp = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; worker-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src *; img-src * data: blob:; frame-src *;"
     elif setting["csp_unsafe_eval"]:
         csp = "script-src 'self' 'unsafe-eval' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: data: blob:; default-src 'self' http: https: data: blob: 'unsafe-inline';"
+    elif setting.get("anubis"):
+        # Anubis's proof-of-work challenge needs to run a WASM worker from the same origin;
+        # browsers intersect multiple CSP headers, so nginx's default policy would otherwise
+        # silently block it even though Anubis serves its own permissive CSP.
+        csp = "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline';"
     else:
         csp = "script-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: data:; default-src 'self' http: https: data: blob: 'unsafe-inline';"
 
@@ -361,10 +558,11 @@ def generate_security_headers(setting: Dict[str, Any], indent: str = "        ",
     return "\n" + "\n".join(headers)
 
 
-def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ", has_handlers: bool = False) -> str:
+def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ", has_handlers: bool = False,
+                     upstream_override: str = "", internal: bool = False) -> str:
     """Unified path router logic. Evaluates and merges constraints gracefully."""
     blocks = []
-    
+
     # Process rate-limit parameters mapped to distinct locations
     processed_limits: Dict[str, str] = {}
     for path, rate in setting["rate_limit"].items():
@@ -374,19 +572,28 @@ def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "  
 
     # Context A: Target constraints specified explicitly via allowed_paths whitelist
     if setting["allowed_paths"]:
+        # A map-based upstream_override can't rescue a path from the `location / { return 404 }`
+        # catch-all below, so the anubis challenge assets need their own explicit carve-out here.
+        if not internal and setting.get("anubis"):
+            blocks.append(
+                f"{indent}location ^~ /.within.website/ {{\n"
+                f"{build_proxy_pass_block(setting, indent + '    ', '', has_handlers, upstream_override='anubis_backend')}\n"
+                f"{indent}}}"
+            )
+
         for path in setting["allowed_paths"]:
             rate_zone = processed_limits.get(path, "")
-            
-            blocks.append(f"{indent}location ^~ {path}/ {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
-            blocks.append(f"{indent}location = {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
-        
+
+            blocks.append(f"{indent}location ^~ {path}/ {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers, upstream_override, internal)}\n{indent}}}")
+            blocks.append(f"{indent}location = {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers, upstream_override, internal)}\n{indent}}}")
+
         # Deny unauthorized access patterns explicitly
         blocks.append(f"{indent}location / {{\n{indent}    return 404;\n{indent}}}")
         return "\n\n".join(blocks)
 
     # Context B: Standard deployment structure mixed with arbitrary rate-limiting zones
     all_defined_paths: Set[str] = set(processed_limits.keys())
-    
+
     # Sort paths carefully: longest string literal rules take priority structural parsing sequence
     for path in sorted(all_defined_paths, key=lambda x: (-len(x), x)):
         if path == "/":
@@ -394,22 +601,31 @@ def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "  
         rate_zone = processed_limits[path]
         loc_modifier = "~ " if "*" in path else ""
         clean_path = path.replace("*", ".*") if "*" in path else path
-        
-        blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+
+        blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers, upstream_override, internal)}\n{indent}}}")
 
     # Fallback primary route block location targeting context root "/"
     root_rate_zone = processed_limits.get("/", "")
-    blocks.append(f"{indent}location / {{\n{build_proxy_pass_block(setting, indent + '    ', root_rate_zone, has_handlers)}\n{indent}}}")
+    blocks.append(f"{indent}location / {{\n{build_proxy_pass_block(setting, indent + '    ', root_rate_zone, has_handlers, upstream_override, internal)}\n{indent}}}")
 
     return "\n\n".join(blocks)
 
 
-def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ") -> str:
-    """Generate Nginx location blocks for serving static files based on path mapping dictionary."""
+def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ",
+                            anubis_rules: List[Any] = None) -> str:
+    """Generate Nginx location blocks for serving static files based on path mapping dictionary.
+
+    When anubis_rules is given (non-internal static blocks only): `location = {k}` exact blocks
+    that anubis fully claims are suppressed (nginx rejects duplicate `location =` blocks for the
+    same path - the real content stays reachable via the internal loopback block instead), and
+    anubis-routed locations are interleaved so they take proper nginx location-resolution
+    precedence: anubis-exact -> static-exact -> static-prefix -> anubis-regex -> static-regex.
+    (Anubis exact blocks win over static prefix/regex per nginx's own resolution rules regardless
+    of emission order, so only the regex tier needs explicit ahead-of placement.)"""
     blocks = []
     paths = setting.get("path", {})
     rate_limits = setting.get("rate_limit", {})
-    
+
     # Map rate limits to zones
     processed_limits = {}
     for path, rate in rate_limits.items():
@@ -429,6 +645,8 @@ def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: st
         if k.endswith("/**"):
             clean_k = k[:-3]
             if v.strip().endswith("/"):
+                # Directory target: preserve the matched sub-path via the regex capture
+                # group so distinct files under it are served instead of the bare directory.
                 alias_base = target_path.rstrip("/")
                 regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{{rate_limit_line}\n{indent}    alias {alias_base}$1;\n{indent}}}")
             else:
@@ -442,10 +660,26 @@ def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: st
         elif k.endswith("/"):
             prefix_blocks.append(f"{indent}location {k} {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
         else:
+            if anubis_rules and anubis_decision(anubis_rules, k):
+                continue
             exact_blocks.append(f"{indent}location = {k} {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
 
+    anubis_exact_blocks: List[str] = []
+    anubis_regex_blocks: List[str] = []
+    if anubis_rules:
+        anubis_setting = {**setting, "_anubis_force_xff": True}
+        for spec in anubis_location_specs(anubis_rules):
+            proxy_block = build_proxy_pass_block(anubis_setting, indent + "    ", "", False, upstream_override="anubis_backend")
+            block = f"{indent}location {spec} {{\n{proxy_block}\n{indent}}}"
+            if spec.startswith("="):
+                anubis_exact_blocks.append(block)
+            else:
+                anubis_regex_blocks.append(block)
+
+    blocks.extend(anubis_exact_blocks)
     blocks.extend(exact_blocks)
     blocks.extend(prefix_blocks)
+    blocks.extend(anubis_regex_blocks)
     blocks.extend(regex_blocks)
 
     # Default / fallback location block pointing to /public
@@ -455,6 +689,48 @@ def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: st
         blocks.append(f"{indent}location / {{{root_rate_line}\n{indent}    root /public;\n{indent}    index index.html index.htm;\n{indent}}}")
 
     return "\n\n".join(blocks)
+
+
+def generate_anubis_upstream_map(setting: Dict[str, Any], domain_safe: str) -> str:
+    """Generate a `map $uri $anubis_up_<domain>` block selecting, per-request, whether a proxy-type
+    domain's public block should hit anubis_backend or the domain's real upstream. Returns "" when
+    the domain has no anubis rules."""
+    rules = compile_anubis_rules(setting.get("anubis", {}))
+    if not rules:
+        return ""
+
+    var_name = f"anubis_up_{domain_safe}"
+    entries = anubis_map_entries(rules, setting["upstream_name"])
+    lines = [f"    map $uri ${var_name} {{", f"        default {setting['upstream_name']};"]
+    for key, target in entries:
+        quoted_key = f'"{key}"' if key.startswith("~") else key
+        lines.append(f"        {quoted_key} {target};")
+    lines.append("    }")
+    return "\n".join(lines)
+
+
+def generate_internal_server_block(main_entry: Dict[str, Any], domain_safe: str) -> str:
+    """Generate the internal (anubis-loopback) server block for a domain: no TLS, no security
+    headers, no rate limiting, no error handlers - Anubis re-enters here on the domain's real
+    routes/content after a challenge is passed, and this block hands off to the real upstream or
+    static files exactly as the public block would with anubis disabled."""
+    domain = main_entry["domain"]
+    internal_entry = {**main_entry, "rate_limit": {}, "anubis": {}}
+
+    is_static = main_entry["type"] in ["static-http", "static-https", "static-https-only"]
+    if is_static:
+        routes_content = generate_static_routes(internal_entry, domain_safe, indent="        ")
+    else:
+        routes_content = generate_routes(internal_entry, domain_safe, indent="        ", internal=True)
+
+    return f"""    # {domain} - Anubis internal loopback
+    server {{
+        listen 8081;
+        server_name {domain};
+        client_max_body_size {main_entry['max_body_size']};
+
+{routes_content}
+    }}"""
 
 
 def generate_redirect_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "        ") -> str:
@@ -548,6 +824,14 @@ def generate_error_handlers_locations(handlers: List[Dict[str, Any]], indent: st
     return "\n\n".join(blocks)
 
 
+def _anubis_enabled(settings: List[Dict[str, Any]]) -> bool:
+    """True if at least one domain's main entry has any enabled anubis rule."""
+    return any(
+        s["error_code"] is None and any(s.get("anubis", {}).values())
+        for s in settings
+    )
+
+
 def generate_upstream_blocks(settings: List[Dict[str, Any]]) -> str:
     """Generate independent upstream server block allocations."""
     active_proxy_settings = []
@@ -559,10 +843,15 @@ def generate_upstream_blocks(settings: List[Dict[str, Any]]) -> str:
         if not is_static and not is_redirect:
             active_proxy_settings.append(s)
 
-    return "\n\n".join([
+    blocks = [
         f"    upstream {s['upstream_name']} {{\n        server {s['host']}:{s['port']};\n        keepalive 32;\n    }}"
         for s in active_proxy_settings
-    ])
+    ]
+
+    if _anubis_enabled(settings):
+        blocks.append("    upstream anubis_backend {\n        server anubis:8080;\n        keepalive 32;\n    }")
+
+    return "\n\n".join(blocks)
 
 
 def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
@@ -622,11 +911,15 @@ def generate_http_redirect_server(grouped_settings: Dict[str, List[Dict[str, Any
 
         is_static = main_entry["type"] == "static-http"
         has_handlers = len(handlers) > 0
+        anubis_rules = compile_anubis_rules(main_entry.get("anubis", {}))
 
         if is_static:
-            routes_content = generate_static_routes(main_entry, domain_safe, indent="        ")
+            routes_content = generate_static_routes(main_entry, domain_safe, indent="        ", anubis_rules=anubis_rules)
         else:
-            routes_content = generate_routes(main_entry, domain_safe, indent="        ", has_handlers=has_handlers)
+            proxied_entry = {**main_entry, "_anubis_force_xff": True} if anubis_rules else main_entry
+            upstream_override = f"$anubis_up_{domain_safe}" if anubis_rules else ""
+            routes_content = generate_routes(proxied_entry, domain_safe, indent="        ", has_handlers=has_handlers,
+                                              upstream_override=upstream_override)
 
         blocks.append(f"""    # {dom} - HTTP Core Forwarding
     server {{
@@ -661,13 +954,17 @@ def generate_ssl_server_block(main_entry: Dict[str, Any], handlers: List[Dict[st
     has_handlers = len(handlers) > 0
     is_static = main_entry["type"] in ["static-http", "static-https", "static-https-only"]
     is_redirect = main_entry["type"] in ["redirect-temp", "redirect-perm"]
+    anubis_rules = compile_anubis_rules(main_entry.get("anubis", {}))
 
     if is_static:
-        routes_content = generate_static_routes(main_entry, domain_safe, indent="        ")
+        routes_content = generate_static_routes(main_entry, domain_safe, indent="        ", anubis_rules=anubis_rules)
     elif is_redirect:
         routes_content = generate_redirect_routes(main_entry, domain_safe, indent="        ")
     else:
-        routes_content = generate_routes(main_entry, domain_safe, indent="        ", has_handlers=has_handlers)
+        proxied_entry = {**main_entry, "_anubis_force_xff": True} if anubis_rules else main_entry
+        upstream_override = f"$anubis_up_{domain_safe}" if anubis_rules else ""
+        routes_content = generate_routes(proxied_entry, domain_safe, indent="        ", has_handlers=has_handlers,
+                                          upstream_override=upstream_override)
 
     return f"""    # {domain} - Production TLS Context
     server {{
@@ -784,6 +1081,42 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     service_servers_text = "\n\n".join(service_blocks) if service_blocks else ""
     http_servers_text = generate_http_redirect_server(domains_map)
 
+    # Anubis bot-protection: per-domain dispatch maps + the internal loopback blocks Anubis
+    # re-enters on after a client passes its challenge. Entirely absent when no domain enables it.
+    anubis_maps: List[str] = []
+    internal_server_blocks: List[str] = []
+    anubis_globals_text = ""
+    if _anubis_enabled(settings):
+        anubis_globals_text = """
+    # Anubis forwarded-header passthrough (used only on the internal :8081 loopback)
+    map $http_x_forwarded_proto $anubis_fwd_proto { default $http_x_forwarded_proto; "" $scheme; }
+    map $http_x_forwarded_port  $anubis_fwd_port  { default $http_x_forwarded_port;  "" $server_port; }
+    map $http_x_forwarded_host  $anubis_fwd_host  { default $http_x_forwarded_host;  "" $host; }
+"""
+        for dom, group in domains_map.items():
+            main_entry = next(s for s in group if s["error_code"] is None)
+            rules = compile_anubis_rules(main_entry.get("anubis", {}))
+            if not rules:
+                continue
+
+            domain_safe = dom.replace("*", "wildcard").replace(".", "_").replace("-", "_")
+            is_static = main_entry["type"] in ["static-http", "static-https", "static-https-only"]
+
+            if not is_static:
+                anubis_maps.append(generate_anubis_upstream_map(main_entry, domain_safe))
+
+            internal_server_blocks.append(generate_internal_server_block(main_entry, domain_safe))
+
+        # Tripwire: Anubis dispatches by Host header (server_name below). If that ever stopped
+        # being preserved, every anubis-enabled domain would silently fall through to whichever
+        # internal block happens to be first instead of failing loudly.
+        internal_server_blocks.append(
+            "    server {\n        listen 8081 default_server;\n        server_name _;\n        return 421;\n    }"
+        )
+
+    anubis_maps_text = ("\n\n" + "\n\n".join(anubis_maps)) if anubis_maps else ""
+    internal_servers_text = "\n\n".join(internal_server_blocks) if internal_server_blocks else ""
+
     return f"""events {{
     worker_connections 1024;
 }}
@@ -812,7 +1145,7 @@ http {{
     set_real_ip_from 192.168.0.0/16;
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
-
+{anubis_globals_text}
     # Production SSL Hardening Context Parameters
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
@@ -821,13 +1154,13 @@ http {{
     ssl_session_timeout 10m;
 
     # Upstream Definitions
-{generate_upstream_blocks(settings)}
+{generate_upstream_blocks(settings)}{anubis_maps_text}
 
 {http_servers_text}
 
 {ssl_servers_text}
 
-{service_servers_text}
+{service_servers_text}{("\n\n" + internal_servers_text) if internal_servers_text else ""}
 }}"""
 
 
