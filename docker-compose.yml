@@ -5,14 +5,55 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: oneserver
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - ${ONESERVER_PWD:-.}/cert:/etc/nginx/ssl:ro
       - ${ONESERVER_PWD:-.}/nginx-logs:/var/log/nginx
       - ${ONESERVER_PWD:-.}/public:/public:ro
     restart: unless-stopped
+    depends_on:
+      anubis:
+        condition: service_healthy
+    networks:
+      - oneserver_bridge
+
+  # Anubis bot-protection proxy. nginx routes anubis-enabled paths here (see the `anubis` key
+  # in settings.json); Anubis then hands passed requests back to nginx on the internal :8081
+  # loopback (TARGET), never back onto :80/:443, so there is no redirect loop.
+  anubis:
+    image: ghcr.io/techarohq/anubis:latest
+    container_name: anubis
+    restart: unless-stopped
+    environment:
+      BIND: ":8080"
+      DIFFICULTY: "4"
+      METRICS_BIND: ":9090"
+      SERVE_ROBOTS_TXT: "true"
+      TARGET: "http://oneserver:8081"
+      POLICY_FNAME: "/data/cfg/botPolicy.yaml"
+      OG_PASSTHROUGH: "true"
+      OG_EXPIRY_TIME: "24h"
+    healthcheck:
+      test: ["CMD", "anubis", "--healthcheck"]
+      interval: 5s
+      timeout: 30s
+      retries: 5
+      start_period: 500ms
+    # ports:
+    #   - 8080:8080
+    volumes:
+      - "./botPolicy.yaml:/data/cfg/botPolicy.yaml:ro"
+    networks:
+      - oneserver_bridge
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared_tunnel
+    restart: always
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      - oneserver
     networks:
       - oneserver_bridge
 

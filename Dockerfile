@@ -21,3 +21,6 @@ COPY --from=builder /app/nginx.conf /etc/nginx/nginx.conf
 RUN mkdir -p /etc/nginx/ssl /var/www/certbot
 
 EXPOSE 80 443
+# 8081 is the internal Anubis loopback (see settings.json's `anubis` key) - reachable only
+# from other containers on oneserver_bridge, never published to the host.
+EXPOSE 8081
