@@ -12,7 +12,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 from collections import Counter
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
 
 
 # Settings that a `service` template silently ignores (the template only substitutes a
@@ -77,27 +77,75 @@ def is_wsl_mirrored() -> bool:
 
 
 def load_settings(file_path: str) -> List[Dict[str, Any]]:
-    """Load settings safely from JSON file, stripping comments if present."""
+    """Load settings safely from JSON file, stripping comments outside strings and recording line numbers."""
     try:
         with open(file_path, "r") as f:
-            content = f.read()
+            raw_content = f.read()
         
-        # Simple comment stripping (//)
+        # Track line numbers of top-level objects in the JSON list
+        object_lines = []
+        in_str = False
+        escape = False
+        depth = 0
+        for idx, ch in enumerate(raw_content):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "\"":
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+                if depth == 1:
+                    line_no = raw_content.count("\n", 0, idx) + 1
+                    object_lines.append(line_no)
+            elif ch == "}":
+                depth -= 1
+
+        # Strip // comments only when NOT inside a string literal
         lines = []
-        for line in content.splitlines():
-            pos = line.find("//")
-            while pos != -1:
-                if pos > 0 and line[pos - 1] == ':':
-                    pos = line.find("//", pos + 2)
-                else:
-                    line = line[:pos]
+        in_string = False
+        for line in raw_content.splitlines():
+            out_chars = []
+            i = 0
+            escaped = False
+            while i < len(line):
+                c = line[i]
+                if escaped:
+                    out_chars.append(c)
+                    escaped = False
+                    i += 1
+                    continue
+                if c == "\\":
+                    out_chars.append(c)
+                    escaped = True
+                    i += 1
+                    continue
+                if c == "\"":
+                    in_string = not in_string
+                    out_chars.append(c)
+                    i += 1
+                    continue
+                if not in_string and c == "/" and i + 1 < len(line) and line[i + 1] == "/":
                     break
-            lines.append(line)
+                out_chars.append(c)
+                i += 1
+            lines.append("".join(out_chars))
         
         settings = json.loads("\n".join(lines))
 
         if not isinstance(settings, list):
             raise ValueError("Settings must be a list of domain configurations")
+
+        # Attach line numbers to top-level dictionary items
+        for idx, s in enumerate(settings):
+            if isinstance(s, dict):
+                s["__line__"] = object_lines[idx] if idx < len(object_lines) else None
 
         return settings
     except FileNotFoundError:
@@ -110,22 +158,52 @@ def load_settings(file_path: str) -> List[Dict[str, Any]]:
 
 def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     """Validate, normalize, and safely parse domain parameters."""
+    line_info = f" (line {setting['__line__']})" if setting.get("__line__") else ""
     connection_type = setting.get("type", "https-only")
-    if "domain" not in setting:
+    is_default_server = False
+
+    if connection_type == "default-server" or connection_type.startswith("default-server:"):
+        is_default_server = True
+        domain = "_"
+        if connection_type == "default-server":
+            if "forwarding" in setting and setting["forwarding"]:
+                connection_type = "http"
+            elif "path" in setting and setting["path"]:
+                has_ssl_certs = bool(setting.get("ca-bundle") or setting.get("ca_bundle"))
+                connection_type = "static-https" if has_ssl_certs else "static-http"
+            else:
+                connection_type = "static-https"
+        else:
+            type_part = connection_type.split(":", 1)[1].strip()
+            valid_target_types = [
+                "http", "https", "https-only",
+                "redirect-temp", "redirect-perm",
+                "static-http", "static-https", "static-https-only"
+            ]
+            if type_part not in valid_target_types:
+                raise ValueError(f"Invalid target type '{type_part}' in default-server type '{connection_type}'{line_info}")
+            connection_type = type_part
+    elif "domain" not in setting:
         if ":" in connection_type:
             domain = "*"
         else:
-            raise ValueError("Missing required field 'domain' in domain configuration")
+            raise ValueError(f"Missing required field 'domain' in domain configuration{line_info}")
     else:
         domain = setting["domain"].strip()
+        if not domain:
+            raise ValueError(f"Domain name cannot be empty in domain configuration{line_info}")
+
     error_code = None
-    if ":" in connection_type:
+    if not is_default_server and ":" in connection_type:
         parts = connection_type.split(":", 1)
         code_str = parts[0].strip()
         type_part = parts[1].strip()
-        if code_str != "*" and not code_str.isdigit():
-            raise ValueError(f"Invalid error code format in type '{connection_type}' for domain '{domain}'")
-        error_code = int(code_str) if code_str.isdigit() else "*"
+        if not code_str.isdigit():
+            raise ValueError(f"Invalid error code format in type '{connection_type}' for domain '{domain}'{line_info}. Note: wildcard '*' catch-alls are no longer supported; use 'default-server' for unknown domain handling.")
+        code_int = int(code_str)
+        if code_int < 300 or code_int > 599:
+            raise ValueError(f"Error code '{code_int}' in type '{connection_type}' for domain '{domain}'{line_info} is out of valid HTTP error range (300-599)")
+        error_code = code_int
         
         valid_target_types = [
             "http", "https", "https-only",
@@ -133,58 +211,75 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
             "static-http", "static-https", "static-https-only"
         ]
         if type_part not in valid_target_types:
-            raise ValueError(f"Invalid target type '{type_part}' in error handler type '{connection_type}' for domain '{domain}'")
+            raise ValueError(f"Invalid target type '{type_part}' in error handler type '{connection_type}' for domain '{domain}'{line_info}")
         connection_type = type_part
-    else:
+    elif not is_default_server:
         valid_types = [
             "http", "https", "https-only",
             "redirect-temp", "redirect-perm",
             "static-http", "static-https", "static-https-only"
         ]
         if connection_type not in valid_types:
-            raise ValueError(f"Invalid type '{connection_type}' in domain configuration for domain '{domain}'")
+            raise ValueError(f"Invalid type '{connection_type}' in domain configuration for domain '{domain}'{line_info}")
 
     is_static = connection_type in ["static-http", "static-https", "static-https-only"]
     is_redirect = connection_type in ["redirect-temp", "redirect-perm"]
 
     service_name_raw = setting.get("service", "").strip()
-    if service_name_raw and connection_type not in ["http", "https", "https-only"]:
-        raise ValueError(
-            f"'service' template '{service_name_raw}' can only be combined with type "
-            f"'http', 'https', or 'https-only' (got '{connection_type}') for domain '{domain}'"
-        )
+    if service_name_raw:
+        if connection_type not in ["http", "https", "https-only"]:
+            raise ValueError(
+                f"'service' template '{service_name_raw}' can only be combined with type "
+                f"'http', 'https', or 'https-only' (got '{connection_type}') for domain '{domain}'{line_info}"
+            )
+        template_file = Path("services") / f"{service_name_raw}.conf"
+        if not template_file.exists():
+            raise ValueError(
+                f"Service template '{service_name_raw}.conf' not found in 'services/' directory for domain '{domain}'{line_info}. "
+                "Ensure the template file exists before referencing it."
+            )
 
     if not is_static:
         if "forwarding" not in setting or not setting["forwarding"]:
-            raise ValueError(f"Missing required field 'forwarding' for type '{connection_type}' in domain '{domain}'")
+            raise ValueError(f"Missing required field 'forwarding' for type '{connection_type}' in domain '{domain}'{line_info}")
 
-    # Normalize rate-limit format
-    rate_limit = setting.get("rate-limit", setting.get("rate_limit", {}))
-    if isinstance(rate_limit, (int, float)):
-        rate_limit = {"/": rate_limit}
-    elif not isinstance(rate_limit, dict):
-        rate_limit = {}
+    # Validate and normalize rate-limit format
+    raw_rate_limit = setting.get("rate-limit", setting.get("rate_limit", {}))
+    if isinstance(raw_rate_limit, (int, float)):
+        raw_rate_limit = {"/": raw_rate_limit}
+    elif not isinstance(raw_rate_limit, dict):
+        raw_rate_limit = {}
+
+    normalized_rate_limit = {}
+    for r_path, r_val in raw_rate_limit.items():
+        if not isinstance(r_val, (int, float)):
+            raise ValueError(f"Rate limit value for path '{r_path}' in domain '{domain}'{line_info} must be a number (got '{r_val}')")
+        if r_val <= 0:
+            raise ValueError(f"Rate limit for path '{r_path}' in domain '{domain}'{line_info} cannot be 0 or negative (got {r_val}). It must be greater than 0.")
+        # Clamp fractional rate limits between 0 and 1 to minimum 1r/m
+        clamped_val = max(1, int(round(r_val))) if r_val >= 1 else 1
+        normalized_rate_limit[r_path] = clamped_val
 
     # Validate SSL requirements for redirect types & secure static types
     ca_bundle = setting.get("ca-bundle", setting.get("ca_bundle", "")).strip()
     private_key = setting.get("private-key", setting.get("private_key", "")).strip()
 
-    if error_code is None:
+    if error_code is None and not is_default_server:
         if is_redirect or connection_type in ["static-https", "static-https-only"]:
             if not ca_bundle:
-                raise ValueError(f"ca-bundle is required for type '{connection_type}' in domain '{domain}'")
+                raise ValueError(f"ca-bundle is required for type '{connection_type}' in domain '{domain}'{line_info}")
             if not private_key:
-                raise ValueError(f"private-key is required for type '{connection_type}' in domain '{domain}'")
+                raise ValueError(f"private-key is required for type '{connection_type}' in domain '{domain}'{line_info}")
 
     # Normalize allowed-paths safely
     allowed_paths = setting.get("allowed-paths", setting.get("allowed_paths", []))
     if not isinstance(allowed_paths, list):
-        raise ValueError("'allowed-paths' must be a list of path strings")
+        raise ValueError(f"'allowed-paths' must be a list of path strings in domain '{domain}'{line_info}")
 
     normalized_paths = []
     for path in allowed_paths:
         if not isinstance(path, str):
-            raise ValueError("All entries in 'allowed-paths' must be strings")
+            raise ValueError(f"All entries in 'allowed-paths' must be strings in domain '{domain}'{line_info}")
         p = path.strip()
         if not p.startswith("/"):
             p = "/" + p
@@ -195,23 +290,21 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     # Validate path mappings for static types
     paths = setting.get("path", {})
     if not isinstance(paths, dict):
-        raise ValueError("'path' must be a dictionary of route mappings")
+        raise ValueError(f"'path' must be a dictionary of route mappings in domain '{domain}'{line_info}")
     
     normalized_paths_dict = {}
     for k, v in paths.items():
         if not isinstance(k, str) or not isinstance(v, str):
-            raise ValueError("All keys and values in 'path' must be strings")
+            raise ValueError(f"All keys and values in 'path' must be strings in domain '{domain}'{line_info}")
         k_clean = k.strip()
         v_clean = v.strip()
         # Warning if target points to root directory /
         if v_clean in ["/", "", "./"]:
             print(f"Warning: Path mapping target '{v_clean}' for route '{k_clean}' in domain '{domain}' points to the root directory.", file=sys.stderr)
         # Error if source path does not end with / but target path ends with /.
-        # Wildcard keys ('/x/*' or '/x/**') are exempt: they route sub-paths beneath
-        # the key's base, so a directory target is expected and valid there.
         is_wildcard_key = k_clean.endswith("/*") or k_clean.endswith("/**")
         if not k_clean.endswith("/") and not is_wildcard_key and v_clean.endswith("/"):
-            raise ValueError(f"Invalid path mapping '{k_clean}': '{v_clean}' in domain '{domain}'. Check if the target path is a directory (ends with '/') when the source path does not end with '/'.")
+            raise ValueError(f"Invalid path mapping '{k_clean}': '{v_clean}' in domain '{domain}'{line_info}. Check if the target path is a directory (ends with '/') when the source path does not end with '/'.")
         normalized_paths_dict[k_clean] = v_clean
 
     # Check for conflicting wildcard definitions on the same base path
@@ -219,20 +312,22 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         if k.endswith("/**"):
             base = k[:-3]
             if base + "/*" in normalized_paths_dict:
-                raise ValueError(f"Conflicting path mappings: '{k}' and '{base}/*' cannot be used together in domain '{domain}'")
+                raise ValueError(f"Conflicting path mappings: '{k}' and '{base}/*' cannot be used together in domain '{domain}'{line_info}")
         elif k.endswith("/*"):
             base = k[:-2]
             if base + "/**" in normalized_paths_dict:
-                raise ValueError(f"Conflicting path mappings: '{k}' and '{base}/**' cannot be used together in domain '{domain}'")
+                raise ValueError(f"Conflicting path mappings: '{k}' and '{base}/**' cannot be used together in domain '{domain}'{line_info}")
 
     validated = {
+        "__line__": setting.get("__line__"),
         "domain": domain,
+        "is_default_server": is_default_server,
         "forwarding": setting.get("forwarding", "").strip() if not is_static else "",
         "type": connection_type,
         "error_code": error_code,
         "ca_bundle": ca_bundle,
         "private_key": private_key,
-        "rate_limit": rate_limit,
+        "rate_limit": normalized_rate_limit,
         "websocket": setting.get("websocket", True),
         "compression": setting.get("compression", True),
         "security_headers": setting.get("security-headers", setting.get("security_headers", True)),
@@ -244,7 +339,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
         "proxy_buffering_off": setting.get("proxy-buffering-off", setting.get("proxy_buffering_off", False)) or False,
         "proxy_cache_off": setting.get("proxy-cache-off", setting.get("proxy_cache_off", False)) or False,
         "proxy_intercept_errors": setting.get("proxy-intercept-errors", setting.get("proxy_intercept_errors", False)),
-        "service": setting.get("service", "").strip(),
+        "service": service_name_raw,
         "forward_url_path": setting.get("forward-url-path", setting.get("forward_url_path", False)),
         "path": normalized_paths_dict,
         "no_x_forwarded_for": setting.get("no-x-forwarded-for", setting.get("no_x_forwarded_for", False)),
@@ -254,6 +349,7 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
     # Extract hostname/port if not static and not redirect
     if not is_static and not is_redirect:
         forwarding_target = validated["forwarding"]
+        is_upstream_https = forwarding_target.startswith("https://")
         if not (forwarding_target.startswith("http://") or forwarding_target.startswith("https://")):
             forwarding_target = f"http://{forwarding_target}"
         
@@ -262,11 +358,20 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
             validated["host"] = parsed_url.hostname if parsed_url.hostname else "127.0.0.1"
             if ":" in validated["host"] and not validated["host"].startswith("["):
                 validated["host"] = f"[{validated['host']}]"
-            validated["port"] = parsed_url.port if parsed_url.port else 80
+            default_port = 443 if is_upstream_https else 80
+            validated["port"] = parsed_url.port if parsed_url.port else default_port
+            validated["upstream_ssl"] = is_upstream_https
         except Exception:
-            raise ValueError(f"Could not parse forwarding target address: {validated['forwarding']}")
+            raise ValueError(f"Could not parse forwarding target address: {validated['forwarding']}{line_info}")
         
-        validated["upstream_name"] = validated["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_") + "_backend"
+        domain_safe = validated["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_")
+        if is_default_server:
+            validated["upstream_name"] = "default_server_backend"
+        elif error_code is not None:
+            lbl = "wildcard" if error_code == "*" else str(error_code)
+            validated["upstream_name"] = f"{domain_safe}_error_{lbl}_backend"
+        else:
+            validated["upstream_name"] = f"{domain_safe}_backend"
 
     if validated["service"] and (Path("services") / f"{validated['service']}.conf").exists():
         ignored_present = [display for display, keys in IGNORED_WHEN_SERVICE if any(k in setting for k in keys)]
@@ -283,10 +388,14 @@ def validate_setting(setting: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_proxy_pass_block(setting: Dict[str, Any], indent: str, rate_zone: str = "", has_handlers: bool = False) -> str:
     """Consolidate generation logic to avoid code repetition across routes."""
+    proxy_scheme = "https" if setting.get("upstream_ssl", False) else "http"
     lines = [
-        f"{indent}proxy_pass http://{setting['upstream_name']};",
+        f"{indent}proxy_pass {proxy_scheme}://{setting['upstream_name']};",
         f"{indent}proxy_set_header Host $host;"
     ]
+
+    if setting.get("upstream_ssl", False):
+        lines.append(f"{indent}proxy_ssl_server_name on;")
 
     if not setting.get("no_x_forwarded_for", False):
         lines.extend([
@@ -376,9 +485,14 @@ def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "  
     if setting["allowed_paths"]:
         for path in setting["allowed_paths"]:
             rate_zone = processed_limits.get(path, "")
-            
-            blocks.append(f"{indent}location ^~ {path}/ {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
-            blocks.append(f"{indent}location = {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+            if path == "/":
+                blocks.append(f"{indent}location = / {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+            elif "*" in path:
+                clean_path = path.replace("*", ".*")
+                blocks.append(f"{indent}location ~ ^{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+            else:
+                blocks.append(f"{indent}location ^~ {path}/ {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+                blocks.append(f"{indent}location = {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
         
         # Deny unauthorized access patterns explicitly
         blocks.append(f"{indent}location / {{\n{indent}    return 404;\n{indent}}}")
@@ -392,10 +506,12 @@ def generate_routes(setting: Dict[str, Any], domain_safe: str, indent: str = "  
         if path == "/":
             continue
         rate_zone = processed_limits[path]
-        loc_modifier = "~ " if "*" in path else ""
-        clean_path = path.replace("*", ".*") if "*" in path else path
-        
-        blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+        if "*" in path:
+            clean_path = path.replace("*", ".*")
+            loc_modifier = "~ ^"
+            blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
+        else:
+            blocks.append(f"{indent}location {path} {{\n{build_proxy_pass_block(setting, indent + '    ', rate_zone, has_handlers)}\n{indent}}}")
 
     # Fallback primary route block location targeting context root "/"
     root_rate_zone = processed_limits.get("/", "")
@@ -435,12 +551,22 @@ def generate_static_routes(setting: Dict[str, Any], domain_safe: str, indent: st
                 regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
         elif k.endswith("/*"):
             clean_k = k[:-2]
-            # Match one level deep
-            regex_blocks.append(f"{indent}location ~ ^{clean_k}/[^/]+$ {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
-            # Deeper matches or clean path return 404
-            regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{\n{indent}    return 404;\n{indent}}}")
+            # Match one level deep (non-recursive)
+            if v.strip().endswith("/"):
+                alias_base = target_path.rstrip("/")
+                regex_blocks.append(f"{indent}location ~ ^{clean_k}/([^/]+)$ {{{rate_limit_line}\n{indent}    alias {alias_base}/$1;\n{indent}}}")
+            else:
+                regex_blocks.append(f"{indent}location ~ ^{clean_k}/[^/]+$ {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
+            # Deeper matches or parent return 404
+            if clean_k:
+                regex_blocks.append(f"{indent}location ~ ^{clean_k}(/.*)?$ {{\n{indent}    return 404;\n{indent}}}")
+            else:
+                regex_blocks.append(f"{indent}location ~ ^/[^/]+/.+$ {{\n{indent}    return 404;\n{indent}}}")
+                regex_blocks.append(f"{indent}location = / {{\n{indent}    return 404;\n{indent}}}")
         elif k.endswith("/"):
-            prefix_blocks.append(f"{indent}location {k} {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
+            # Ensure alias has a trailing slash if location has a trailing slash
+            alias_target = target_path if target_path.endswith("/") else f"{target_path}/"
+            prefix_blocks.append(f"{indent}location {k} {{{rate_limit_line}\n{indent}    alias {alias_target};\n{indent}}}")
         else:
             exact_blocks.append(f"{indent}location = {k} {{{rate_limit_line}\n{indent}    alias {target_path};\n{indent}}}")
 
@@ -474,8 +600,13 @@ def generate_redirect_routes(setting: Dict[str, Any], domain_safe: str, indent: 
             processed_limits[path] = zone_name.replace("__", "_").strip("_")
 
     if forward_url:
-        target_clean = target.rstrip("/")
-        redirect_target = f"{target_clean}$request_uri"
+        if "?" in target:
+            target_base, target_query = target.split("?", 1)
+            target_clean = target_base.rstrip("/")
+            redirect_target = f"{target_clean}$uri?{target_query}&$args"
+        else:
+            target_clean = target.rstrip("/")
+            redirect_target = f"{target_clean}$request_uri"
     else:
         redirect_target = target
 
@@ -484,17 +615,25 @@ def generate_redirect_routes(setting: Dict[str, Any], domain_safe: str, indent: 
             rate_zone = processed_limits.get(path, "")
             rate_limit_line = f"\n{indent}    limit_req zone={rate_zone} burst=5 nodelay;" if rate_zone else ""
             
-            blocks.append(f"{indent}location ^~ {path}/ {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
-            blocks.append(f"{indent}location = {path} {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+            if path == "/":
+                blocks.append(f"{indent}location = / {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+            elif "*" in path:
+                clean_path = path.replace("*", ".*")
+                blocks.append(f"{indent}location ~ ^{clean_path} {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+            else:
+                blocks.append(f"{indent}location ^~ {path}/ {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+                blocks.append(f"{indent}location = {path} {{{rate_limit_line}\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
         
         blocks.append(f"{indent}location / {{\n{indent}    return 404;\n{indent}}}")
     else:
         for path, rate_zone in sorted(processed_limits.items(), key=lambda x: (-len(x[0]), x[0])):
             if path == "/":
                 continue
-            loc_modifier = "~ " if "*" in path else ""
-            clean_path = path.replace("*", ".*") if "*" in path else path
-            blocks.append(f"{indent}location {loc_modifier}{clean_path} {{\n{indent}    limit_req zone={rate_zone} burst=5 nodelay;\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+            if "*" in path:
+                clean_path = path.replace("*", ".*")
+                blocks.append(f"{indent}location ~ ^{clean_path} {{\n{indent}    limit_req zone={rate_zone} burst=5 nodelay;\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
+            else:
+                blocks.append(f"{indent}location {path} {{\n{indent}    limit_req zone={rate_zone} burst=5 nodelay;\n{indent}    return {redirect_code} {redirect_target};\n{indent}}}")
         
         root_rate_zone = processed_limits.get("/", "")
         root_rate_line = f"\n{indent}    limit_req zone={root_rate_zone} burst=5 nodelay;" if root_rate_zone else ""
@@ -507,13 +646,8 @@ def generate_error_page_directives(handlers: List[Dict[str, Any]], indent: str =
     """Generate Nginx error_page directives based on custom handlers."""
     directives = []
     for h in handlers:
-        if h["error_code"] != "*":
-            directives.append(f"{indent}error_page {h['error_code']} = @error_{h['error_code']};")
-        else:
-            common_codes = [400, 401, 402, 403, 404, 408, 429, 500, 502, 503, 504]
-            explicit_codes = {x["error_code"] for x in handlers if x["error_code"] != "*"}
-            wildcard_codes = [c for c in common_codes if c not in explicit_codes]
-            directives.append(f"{indent}error_page {' '.join(map(str, wildcard_codes))} = @error_wildcard;")
+        if h.get("error_code") and h["error_code"] != "*":
+            directives.append(f"{indent}error_page {h['error_code']} @error_{h['error_code']};")
     return "\n" + "\n".join(directives) if directives else ""
 
 
@@ -521,15 +655,22 @@ def generate_error_handlers_locations(handlers: List[Dict[str, Any]], indent: st
     """Generate Nginx location blocks for custom error handlers."""
     blocks = []
     for h in handlers:
-        lbl = "wildcard" if h["error_code"] == "*" else str(h["error_code"])
+        if not h.get("error_code") or h["error_code"] == "*":
+            continue
+        lbl = str(h["error_code"])
         
         loc_lines = []
         if h["type"] in ["redirect-temp", "redirect-perm"]:
             redirect_code = 301 if h["type"] == "redirect-perm" else 302
             target = h["forwarding"]
             if h["forward_url_path"]:
-                target_clean = target.rstrip("/")
-                redirect_target = f"{target_clean}$request_uri"
+                if "?" in target:
+                    target_base, target_query = target.split("?", 1)
+                    target_clean = target_base.rstrip("/")
+                    redirect_target = f"{target_clean}$uri?{target_query}&$args"
+                else:
+                    target_clean = target.rstrip("/")
+                    redirect_target = f"{target_clean}$request_uri"
             else:
                 redirect_target = target
             loc_lines.append(f"{indent}    return {redirect_code} {redirect_target};")
@@ -538,11 +679,15 @@ def generate_error_handlers_locations(handlers: List[Dict[str, Any]], indent: st
             if not file_target and h["path"]:
                 file_target = list(h["path"].values())[0]
             if not file_target:
-                file_target = f"{lbl}.html" if lbl != "wildcard" else "error.html"
+                file_target = f"{lbl}.html"
             
+            file_target = file_target.lstrip("/")
             loc_lines.append(f"{indent}    root /public;")
             loc_lines.append(f"{indent}    error_page 405 =200 $uri;")
             loc_lines.append(f"{indent}    rewrite ^ /{file_target} break;")
+        elif h["type"] in ["http", "https", "https-only"]:
+            proxy_pass_code = build_proxy_pass_block(h, indent + "    ")
+            loc_lines.append(proxy_pass_code)
         
         blocks.append(f"{indent}location @error_{lbl} {{\n" + "\n".join(loc_lines) + f"\n{indent}}}")
     return "\n\n".join(blocks)
@@ -550,30 +695,34 @@ def generate_error_handlers_locations(handlers: List[Dict[str, Any]], indent: st
 
 def generate_upstream_blocks(settings: List[Dict[str, Any]]) -> str:
     """Generate independent upstream server block allocations."""
-    active_proxy_settings = []
+    seen_upstreams = set()
+    upstream_blocks = []
     for s in settings:
-        if s["error_code"] is not None:
-            continue
         is_static = s["type"] in ["static-http", "static-https", "static-https-only"]
         is_redirect = s["type"] in ["redirect-temp", "redirect-perm"]
         if not is_static and not is_redirect:
-            active_proxy_settings.append(s)
+            upstream_name = s.get("upstream_name")
+            if upstream_name and upstream_name not in seen_upstreams:
+                seen_upstreams.add(upstream_name)
+                upstream_blocks.append(
+                    f"    upstream {upstream_name} {{\n        server {s['host']}:{s['port']};\n        keepalive 32;\n    }}"
+                )
 
-    return "\n\n".join([
-        f"    upstream {s['upstream_name']} {{\n        server {s['host']}:{s['port']};\n        keepalive 32;\n    }}"
-        for s in active_proxy_settings
-    ])
+    return "\n\n".join(upstream_blocks)
 
 
 def generate_rate_limit_zones(settings: List[Dict[str, Any]]) -> str:
     """Build shared memory limits allocating proportional slots directly based on rulesets."""
     zones = []
+    seen_zones = set()
     for s in settings:
         domain_safe = s["domain"].replace("*", "wildcard").replace(".", "_").replace("-", "_")
         for path, rate in s["rate_limit"].items():
             if rate > 0:
                 zone_name = f"{domain_safe}_{path.replace('/', '_').replace('*', 'wildcard')}_zone".replace("__", "_").strip("_")
-                zones.append(f"    limit_req_zone $binary_remote_addr zone={zone_name}:10m rate={int(rate)}r/m;")
+                if zone_name not in seen_zones:
+                    seen_zones.add(zone_name)
+                    zones.append(f"    limit_req_zone $binary_remote_addr zone={zone_name}:10m rate={int(rate)}r/m;")
     return "\n    # Rate limiting zones\n" + "\n".join(zones) if zones else ""
 
 
@@ -644,6 +793,138 @@ def generate_http_redirect_server(grouped_settings: Dict[str, List[Dict[str, Any
     return "\n\n".join(blocks)
 
 
+def generate_default_http_server(default_server: Optional[Dict[str, Any]] = None) -> str:
+    """Generate default catch-all server block on port 80 for unmatched domains."""
+    content_lines = []
+    location_blocks = []
+
+    if default_server:
+        if default_server["type"] in ["redirect-temp", "redirect-perm"]:
+            redirect_code = 301 if default_server["type"] == "redirect-perm" else 302
+            target = default_server["forwarding"]
+            if default_server.get("forward_url_path"):
+                if "?" in target:
+                    target_base, target_query = target.split("?", 1)
+                    target_clean = target_base.rstrip("/")
+                    redirect_target = f"{target_clean}$uri?{target_query}&$args"
+                else:
+                    target_clean = target.rstrip("/")
+                    redirect_target = f"{target_clean}$request_uri"
+            else:
+                redirect_target = target
+            location_blocks.append(f"        location / {{\n            return {redirect_code} {redirect_target};\n        }}")
+        elif default_server["type"] in ["http", "https", "https-only"]:
+            proxy_block = build_proxy_pass_block(default_server, indent="            ")
+            location_blocks.append(f"        location / {{\n{proxy_block}\n        }}")
+        else:  # static types (static-http, static-https, static-https-only)
+            file_target = default_server.get("path", {}).get("/", "")
+            if not file_target and default_server.get("path"):
+                file_target = list(default_server["path"].values())[0]
+            if not file_target:
+                file_target = "404.html"
+            file_target = file_target.lstrip("/")
+
+            content_lines.append("        error_page 404 @default_error;")
+            location_blocks.append("        location / {\n            return 404;\n        }")
+            location_blocks.append(
+                f"        location @default_error {{\n"
+                f"            root /public;\n"
+                f"            error_page 405 =200 $uri;\n"
+                f"            rewrite ^ /{file_target} break;\n"
+                f"        }}"
+            )
+    else:
+        location_blocks.append("        location / {\n            return 404;\n        }")
+
+    error_directives_str = ("\n" + "\n".join(content_lines)) if content_lines else ""
+    locations_str = "\n\n".join(location_blocks)
+
+    return f"""    # Default Server - HTTP (unknown domains)
+    server {{
+        listen 80 default_server;
+        server_name _;
+
+        location /.well-known/acme-challenge/ {{
+            root /var/www/certbot;
+        }}{error_directives_str}
+
+{locations_str}
+    }}"""
+
+
+def generate_default_ssl_server(default_server: Optional[Dict[str, Any]], actual_settings: List[Dict[str, Any]]) -> str:
+    """Generate default catch-all server block on port 443 for unmatched domains."""
+    default_ca = ""
+    default_key = ""
+    if default_server:
+        default_ca = default_server.get("ca_bundle", "")
+        default_key = default_server.get("private_key", "")
+    
+    if not default_ca:
+        default_ca = next((s["ca_bundle"] for s in actual_settings if s.get("ca_bundle")), "")
+    if not default_key:
+        default_key = next((s["private_key"] for s in actual_settings if s.get("private_key")), "")
+
+    default_ssl_cert = f"/etc/nginx/ssl/{default_ca}" if default_ca else "/etc/nginx/ssl/fullchain.pem"
+    default_ssl_key = f"/etc/nginx/ssl/{default_key}" if default_key else "/etc/nginx/ssl/privkey.pem"
+
+    content_lines = []
+    location_blocks = []
+
+    if default_server:
+        if default_server["type"] in ["redirect-temp", "redirect-perm"]:
+            redirect_code = 301 if default_server["type"] == "redirect-perm" else 302
+            target = default_server["forwarding"]
+            if default_server.get("forward_url_path"):
+                if "?" in target:
+                    target_base, target_query = target.split("?", 1)
+                    target_clean = target_base.rstrip("/")
+                    redirect_target = f"{target_clean}$uri?{target_query}&$args"
+                else:
+                    target_clean = target.rstrip("/")
+                    redirect_target = f"{target_clean}$request_uri"
+            else:
+                redirect_target = target
+            location_blocks.append(f"        location / {{\n            return {redirect_code} {redirect_target};\n        }}")
+        elif default_server["type"] in ["http", "https", "https-only"]:
+            proxy_block = build_proxy_pass_block(default_server, indent="            ")
+            location_blocks.append(f"        location / {{\n{proxy_block}\n        }}")
+        else:  # static types (static-http, static-https, static-https-only)
+            file_target = default_server.get("path", {}).get("/", "")
+            if not file_target and default_server.get("path"):
+                file_target = list(default_server["path"].values())[0]
+            if not file_target:
+                file_target = "404.html"
+            file_target = file_target.lstrip("/")
+
+            content_lines.append("        error_page 404 @default_error;")
+            location_blocks.append("        location / {\n            return 404;\n        }")
+            location_blocks.append(
+                f"        location @default_error {{\n"
+                f"            root /public;\n"
+                f"            error_page 405 =200 $uri;\n"
+                f"            rewrite ^ /{file_target} break;\n"
+                f"        }}"
+            )
+    else:
+        location_blocks.append("        location / {\n            return 404;\n        }")
+
+    error_directives_str = ("\n" + "\n".join(content_lines)) if content_lines else ""
+    locations_str = "\n\n".join(location_blocks)
+
+    return f"""    # Default Server - HTTPS (unknown domains)
+    server {{
+        listen 443 ssl default_server;
+        http2 on;
+        server_name _;
+
+        ssl_certificate {default_ssl_cert};
+        ssl_certificate_key {default_ssl_key};{error_directives_str}
+
+{locations_str}
+    }}"""
+
+
 def generate_ssl_server_block(main_entry: Dict[str, Any], handlers: List[Dict[str, Any]]) -> str:
     """Generate comprehensive production-hardened TLS context configuration parameters."""
     domain = main_entry["domain"]
@@ -685,27 +966,35 @@ def generate_ssl_server_block(main_entry: Dict[str, Any], handlers: List[Dict[st
 
 def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     """Compile global unified definitions framework orchestrating secondary modular dependencies."""
-    # Separate global error handlers (domain == "*") and actual domain settings
-    global_handlers = [s for s in settings if s["domain"] == "*"]
-    actual_settings = [s for s in settings if s["domain"] != "*"]
+    # Find default-server setting if present
+    default_server_settings = [s for s in settings if s.get("is_default_server")]
+    if len(default_server_settings) > 1:
+        line_nums = [str(s["__line__"]) for s in default_server_settings if s.get("__line__")]
+        lines_str = f" (at line(s): {', '.join(line_nums)})" if line_nums else ""
+        raise ValueError(f"More than one 'default-server' configuration block defined{lines_str}")
     
-    actual_domains = {s["domain"] for s in actual_settings}
+    default_server_setting = default_server_settings[0] if default_server_settings else None
+
+    # Filter out default-server from actual domain settings
+    actual_settings = [s for s in settings if not s.get("is_default_server")]
     
-    merged_settings = list(actual_settings)
-    for dom in actual_domains:
-        dom_handlers = [s for s in actual_settings if s["domain"] == dom and s["error_code"] is not None]
-        dom_codes = {h["error_code"] for h in dom_handlers}
-        
-        for gh in global_handlers:
-            if gh["error_code"] not in dom_codes:
-                copied = gh.copy()
-                copied["domain"] = dom
-                merged_settings.append(copied)
-                
-    settings = merged_settings
+    # Check for duplicate main configuration entries for the same domain
+    main_entries_by_domain: Dict[str, List[Dict[str, Any]]] = {}
+    for s in actual_settings:
+        if s.get("error_code") is None:
+            main_entries_by_domain.setdefault(s["domain"], []).append(s)
+
+    for dom, entries in main_entries_by_domain.items():
+        if len(entries) > 1:
+            line_nums = [str(e["__line__"]) for e in entries if e.get("__line__") is not None]
+            lines_str = f" (found at line(s): {', '.join(line_nums)})" if line_nums else ""
+            raise ValueError(
+                f"Duplicate main configuration entries found for domain '{dom}'{lines_str}. "
+                "Each domain can only have one primary configuration block."
+            )
 
     domains_map = {}
-    for s in settings:
+    for s in actual_settings:
         dom = s["domain"]
         if dom not in domains_map:
             domains_map[dom] = []
@@ -714,26 +1003,21 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     for dom, group in domains_map.items():
         main_entry = next((s for s in group if s["error_code"] is None), None)
         if not main_entry:
-            raise ValueError(f"No main configuration entry (without error code prefix) defined for domain '{dom}'")
+            line_info = f" (defined near line {group[0]['__line__']})" if group and group[0].get('__line__') else ""
+            raise ValueError(f"No main configuration entry (without error code prefix) defined for domain '{dom}'{line_info}")
         
         handlers = [s for s in group if s["error_code"] is not None]
         
-        wildcard_handlers = [h for h in handlers if h["error_code"] == "*"]
-        if len(wildcard_handlers) > 1:
-            raise ValueError(f"More than one wildcard '*' error handler defined for domain '{dom}'")
-        
-        code_counts = Counter(h["error_code"] for h in handlers if h["error_code"] != "*")
+        code_counts = Counter(h["error_code"] for h in handlers)
         duplicate_codes = [code for code, count in code_counts.items() if count > 1]
         if duplicate_codes:
-            raise ValueError(f"More than one error handler defined for code(s) {duplicate_codes} for domain '{dom}'")
-            
-        has_specific = any(h["error_code"] != "*" for h in handlers)
-        has_wildcard = any(h["error_code"] == "*" for h in handlers)
-        if has_specific and not has_wildcard:
-            print(f"Warning: Code-specific error handler(s) defined for domain '{dom}', but no wildcard '*' fallback handler is specified.", file=sys.stderr)
+            conflicting_handlers = [h for h in handlers if h["error_code"] in duplicate_codes]
+            line_nums = [str(h["__line__"]) for h in conflicting_handlers if h.get("__line__") is not None]
+            line_info = f" (at line(s): {', '.join(line_nums)})" if line_nums else ""
+            raise ValueError(f"More than one error handler defined for code(s) {duplicate_codes} for domain '{dom}'{line_info}")
 
     gzip_config = ""
-    has_compression = any(s["compression"] for s in settings if s["error_code"] is None)
+    has_compression = any(s["compression"] for s in actual_settings if s["error_code"] is None)
     if has_compression:
         gzip_config = """
     # Gzip compression
@@ -784,6 +1068,32 @@ def generate_nginx_config(settings: List[Dict[str, Any]]) -> str:
     service_servers_text = "\n\n".join(service_blocks) if service_blocks else ""
     http_servers_text = generate_http_redirect_server(domains_map)
 
+    default_http_server = generate_default_http_server(default_server_setting)
+    http_blocks = [default_http_server]
+    if http_servers_text:
+        http_blocks.append(http_servers_text)
+    http_section = "\n\n".join(http_blocks)
+
+    has_ssl = any(s["type"] in ["https", "https-only", "redirect-temp", "redirect-perm", "static-https", "static-https-only"] for s in actual_settings if s.get("error_code") is None)
+    if not has_ssl and default_server_setting:
+        has_ssl = default_server_setting["type"] in ["https", "https-only", "redirect-temp", "redirect-perm", "static-https", "static-https-only"]
+
+    ssl_blocks = []
+    if has_ssl:
+        ssl_blocks.append(generate_default_ssl_server(default_server_setting, actual_settings))
+    if ssl_servers:
+        ssl_blocks.append(ssl_servers_text)
+    if service_blocks:
+        ssl_blocks.append(service_servers_text)
+    ssl_section = "\n\n".join(ssl_blocks)
+
+    server_sections = [http_section]
+    if ssl_section:
+        server_sections.append(ssl_section)
+    servers_text = "\n\n".join(server_sections)
+
+    all_active_settings = actual_settings + ([default_server_setting] if default_server_setting else [])
+
     return f"""events {{
     worker_connections 1024;
 }}
@@ -803,7 +1113,7 @@ http {{
     tcp_nopush on;
     tcp_nodelay on;
     keepalive_timeout 65;
-    server_names_hash_bucket_size 128;{gzip_config}{generate_rate_limit_zones(settings)}
+    server_names_hash_bucket_size 128;{gzip_config}{generate_rate_limit_zones(all_active_settings)}
 
     # Real IP resolution (Trust Docker internal and private networks)
     set_real_ip_from 127.0.0.1;
@@ -821,13 +1131,9 @@ http {{
     ssl_session_timeout 10m;
 
     # Upstream Definitions
-{generate_upstream_blocks(settings)}
+{generate_upstream_blocks(all_active_settings)}
 
-{http_servers_text}
-
-{ssl_servers_text}
-
-{service_servers_text}
+{servers_text}
 }}"""
 
 
@@ -856,11 +1162,10 @@ def main():
 
     try:
         validated_settings = [validate_setting(s) for s in settings_data]
+        nginx_config = generate_nginx_config(validated_settings)
     except ValueError as e:
         print(f"Validation Operational Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    nginx_config = generate_nginx_config(validated_settings)
 
     if args.dry_run:
         print(nginx_config)
