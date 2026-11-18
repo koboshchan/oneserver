@@ -12,7 +12,7 @@ COPY services/ ./services/
 RUN python3 generate_nginx_config.py --input settings.json --output nginx.conf
 
 # Stage 2: Final production image
-FROM nginx:alpine
+FROM nginx:1.31.9-alpine
 
 # Copy generated config from builder
 COPY --from=builder /app/nginx.conf /etc/nginx/nginx.conf
